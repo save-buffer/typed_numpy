@@ -4,22 +4,41 @@ from typing import Literal
 import numpy as np
 import einops
 
-a = np.random.randn(10, 10)
-b = np.random.randn(10, 10)
+g_dim_registry : dict[str, "FullDim"] = {}
 
-# TODO: Prevent creating multiple dims with the same name
 @dataclass
 class FullDim:
     name : str
     size : int
 
+    def __post_init__(self):
+        if self.name in g_dim_registry:
+            if g_dim_registry[self.name] != self:
+                raise ValueError(f"Attempted to redefine a dimension with a different size (old={g_dim_registry[self.name].size}, new={self.size})!")
+        else:
+            g_dim_registry[self.name] = self
+
 @dataclass
 class Sliced:
-    dim : FullDim
+    dim : "Dim"
     start : int
     end : int
 
 Dim = FullDim | Sliced
+
+def dim_start(dim : Dim):
+    match dim: 
+        case FullDim(_, _):
+            return 0
+        case Sliced(d, st, _):
+            return dim_start(d) + st
+
+def dim_end(dim : Dim):
+    match dim:
+        case FullDim(_, s):
+            return s
+        case Sliced(d, _, en):
+            return dim_start(d) + en
 
 def dim_name(dim : Dim):
     match dim:
@@ -57,39 +76,58 @@ def simplify_dim(dim : Dim) -> Dim:
             child = simplify_dim(d)
             match child:
                 case FullDim(n, sz):
+                    if st == 0 and en == sz:
+                        return child
                     return Sliced(child, st, en)
                 case Sliced(full, child_st, child_en):
-                    # TODO: Check bounds
                     length = en - st
+                    slice_start = child_st + st
+                    slice_end = child_st + st + length
+                    if slice_start > child_en or slice_end > child_en:
+                        raise ValueError("Invalid slice")
+                    if child_st + st == 0 and child_st + st + length == full.size:
+                        return full
                     return Sliced(full, child_st + st, child_st + st + length)
+
+@dataclass
+class Constant:
+    value: float
+
+@dataclass
+class Tensor:
+    dims : tuple[FullDim, ...]
 
 BinaryOpType = Literal["+", "-", "*", "/"]
 
 @dataclass
 class BinaryOp:
+    op : BinaryOpType
     lhs : "ExprType"
     rhs : "ExprType"
-    op : BinaryOpType
 
 @dataclass
 class Repeat:
-    child : "ExprType"
     dim : Dim
+    child : "ExprType"
 
 @dataclass
 class Reduce:
-    child : "ExprType"
     dim : Dim
+    child : "ExprType"
 
-ExprType = BinaryOp | Repeat | Reduce | BinaryOp
+ExprType = Tensor | BinaryOp | Repeat | Reduce
 
 class Typed:
-    def __init__(self, arr : np.ndarray, *dim_type : Dim, expr_type=None):
+    def __init__(self, arr : np.ndarray, *dim_type : Dim, expr_type : ExprType | None = None):
         self.arr = arr
         if len(dim_type) != len(self.arr.shape):
             raise ValueError("Number of attributes must match physical dimension")
-        self.dim_type = dim_type
-        self.expr_type = expr_type
+        self.dim_type : tuple[Dim, ...] = dim_type
+        self.expr_type : ExprType = (
+            expr_type
+            if expr_type is not None
+            else Tensor(tuple(dim_full_dim(d) for d in self.dim_type))
+        )
 
     def slice(self, dim : FullDim, start : int | None, end : int | None) -> "Typed":
         slice_expr = []
@@ -132,11 +170,11 @@ class Typed:
 
         nrepeats = dim_size(dim)
         repeated_arr = self.arr[None, :, :].repeat(nrepeats, axis=0)
-        new_expr_type = Repeat(self.expr_type, dim)
+        new_expr_type = Repeat(dim, self.expr_type)
         return Typed(repeated_arr, *new_dim_type, expr_type=new_expr_type)
 
     def rearrange(self, *dims : Dim) -> "Typed":
-        dims = [dim_full_dim(d) for d in dims]
+        dims = tuple(dim_full_dim(d) for d in dims)
 
         dims_by_name = {}
         lhs_str = ""
@@ -175,40 +213,26 @@ class Typed:
         if reduction_dim is None:
             raise ValueError(f"Unknown reduction dimension {d}")
 
-        new_expr_type = Reduce(self.expr_type, reduction_dim)
+        new_expr_type = Reduce(reduction_dim, self.expr_type)
         new_arr = einops.einsum(self.arr, f"{lhs_str} -> {rhs_str}")
         return Typed(new_arr, *new_dim_type, expr_type=new_expr_type)
 
-    def binary_op(self, other : "Typed", op : BinaryOpType):
-        if self.dim_type != other.dim_type:
-            raise ValueError("Binary operations can only occur between tensors with the same shapes")
-        match op:
-            case "+":
-                new_arr = self.arr + other.arr
-            case "-":
-                new_arr = self.arr - other.arr
-            case "*":
-                new_arr = self.arr * other.arr
-            case "/":
-                new_arr = self.arr / other.arr
+    def binary_op(self, other, op : BinaryOpType) -> "Typed":
+        return _binary_op_helper(self, other, op)
 
-        new_dim_type = self.dim_type
-        new_expr_type = BinaryOp(self.expr_type, other.expr_type, "*")
-        return Typed(new_arr, *new_dim_type, expr_type=new_expr_type)
-
-    def __add__(self, other : "Typed") -> "Typed":
+    def __add__(self, other) -> "Typed":
         return self.binary_op(other, "+")
 
-    def __sub__(self, other : "Typed") -> "Typed":
+    def __sub__(self, other) -> "Typed":
         return self.binary_op(other, "-")
 
-    def __mul__(self, other : "Typed") -> "Typed":
+    def __mul__(self, other) -> "Typed":
         return self.binary_op(other, "*")
 
-    def __div__(self, other : "Typed") -> "Typed":
+    def __div__(self, other) -> "Typed":
         return self.binary_op(other, "/")
 
-    def __matmul__(self, other : "Typed") -> "Typed":
+    def __matmul__(self, other) -> "Typed":
         return einsum(self, other, "M N, N K -> M K")
 
     def set(self, other : "Typed"):
@@ -224,6 +248,46 @@ class Typed:
     @property
     def shape(self):
         return self.arr.shape
+
+def _binary_op_helper(slf, other, op):
+    match other:
+        case Typed():
+            if slf.dim_type != other.dim_type:
+                raise ValueError("Binary operations can only occur between tensors with the same shapes")
+            match op:
+                case "+":
+                    new_arr = slf.arr + other.arr
+                case "-":
+                    new_arr = slf.arr - other.arr
+                case "*":
+                    new_arr = slf.arr * other.arr
+                case "/":
+                    new_arr = slf.arr / other.arr
+
+            new_dim_type = slf.dim_type
+            new_expr_type = BinaryOp(
+                op=op,
+                lhs=slf.expr_type,
+                rhs=other.expr_type,
+            )
+            return Typed(new_arr, *new_dim_type, expr_type=new_expr_type)
+        case x:
+            match op:
+                case "+":
+                    new_arr = slf.arr + x
+                case "-":
+                    new_arr = slf.arr - x
+                case "*":
+                    new_arr = slf.arr + x
+                case "/":
+                    new_arr = slf.arr - x
+                    new_dim_type = slf.dim_type
+                    new_expr_type = BinaryOp(
+                        op=op,
+                        lhs=slf.expr_type,
+                        rhs=Constant(x),
+                    )
+            return Typed(new_arr, *new_dim_type, expr_type=new_expr_type)
 
 def einsum(a : Typed, b : Typed, einstr : str) -> Typed:
     lhs, rhs = einstr.split('->')
@@ -251,7 +315,7 @@ def einsum(a : Typed, b : Typed, einstr : str) -> Typed:
     for d in b.dim_type:
         name = dim_name(d)
         if name not in common_dims:
-            a_repeated = a.repeat(d)
+            a_repeated = a_repeated.repeat(d)
 
     b_repeated = b
     for d in a.dim_type:
@@ -285,64 +349,263 @@ def einsum(a : Typed, b : Typed, einstr : str) -> Typed:
 
     return c
 
+@dataclass
+class LexState:
+    spec : str
+
+    def peek(self) -> str | None:
+        return self.spec[0] if self.spec else None
+
+    def consume_whitespace(self):
+        self.spec = self.spec.strip()
+
+    def consume(self) -> str | None:
+        self.consume_whitespace()
+        result = self.peek()
+        if result:
+            self.spec = self.spec[1:]
+        return result
+
+    def expect(self, s : str):
+        self.consume_whitespace()
+        if not self.spec.startswith(s):
+            raise ValueError(f"{s} expected")
+        self.spec = self.spec[len(s):]
+
+def infer_dims_from_expr(expr : ExprType) -> tuple[FullDim, ...]:
+    match expr:
+        case Tensor(dims):
+            return dims
+        case BinaryOp(_, lhs, rhs):
+            lhs_dims = infer_dims_from_expr(lhs)
+            rhs_dims = infer_dims_from_expr(rhs)
+            if lhs_dims is None:
+                return rhs_dims
+            if rhs_dims is None:
+                return lhs_dims
+            if sorted(lhs_dims, key=dim_name) != sorted(rhs_dims, key=dim_name):
+                raise ValueError("Invalid spec: binary op between tensors of incompatible shapes")
+            return lhs_dims
+        case Repeat(along, child):
+            dims = infer_dims_from_expr(child)
+            return (dim_full_dim(along), *dims)
+        case Reduce(along, child):
+            dims = infer_dims_from_expr(child)
+            along_full = dim_full_dim(along)
+            return tuple(d for d in dims if d != along_full)
+
+
+def _construct_expr_from_einsum(a : ExprType, b : ExprType, rhs : Tensor) -> ExprType:
+    dims_a = infer_dims_from_expr(a)
+    dims_b = infer_dims_from_expr(b)
+    dims_rhs = rhs.dims
+
+    a_dims_by_name = { dim_name(d) : d for d in dims_a }
+    b_dims_by_name = { dim_name(d) : d for d in dims_b }
+    rhs_dim_names = { dim_name(d) for d in rhs.dims }
+
+    common_dims = a_dims_by_name.keys() & b_dims_by_name.keys()
+    a_repeated, b_repeated = a, b
+    for name, d in b_dims_by_name.items():
+        if name not in common_dims:
+            a_repeated = Repeat(d, a_repeated)
+
+    for name, d in a_dims_by_name.items():
+        if name not in common_dims:
+            b_repeated = Repeat(d, b_repeated)
+    a, b = a_repeated, b_repeated 
+    
+    reduction_dims = [a_dims_by_name[name] for name in common_dims if name not in rhs_dim_names]
+
+    c = BinaryOp(
+        op="*", 
+        lhs=a,
+        rhs=b,
+    )
+    for d in reduction_dims:
+        c = Reduce(d, c)
+
+    return c
+
+def _parse_dim(lex : LexState) -> FullDim:
+    lex.consume_whitespace()
+    i = 0
+    while i < len(lex.spec) and lex.spec[i].isalpha():
+        i += 1
+
+    dim_name = lex.spec[:i]
+    lex.spec = lex.spec[i:]
+    if dim_name not in g_dim_registry:
+        raise ValueError(f"Parsed dim {dim_name} is not a known dimension!")
+    return g_dim_registry[dim_name]
+
+def _parse_tensor(lex : LexState) -> Tensor:
+    dims = []
+    while True:
+        dims.append(_parse_dim(lex))
+        lex.consume_whitespace()
+        nxt = lex.peek()
+        if nxt is None or not nxt.isalpha():
+            return Tensor(tuple(dims))
+
+def _parse_number(lex : LexState) -> Constant:
+    lex.consume_whitespace()
+    i = 0
+    while i < len(lex.spec) and (lex.spec[i].isdigit() or lex.spec[i] == '.'):
+        i += 1
+    
+    constant = float(lex.spec[:i])
+    lex.spec = lex.spec[i:]
+    return Constant(constant)
+
+def _parse_factor(lex : LexState) -> ExprType:
+    lex.consume_whitespace()
+    if lex.peek() == "(":
+        lex.consume()
+        child = _parse_spec(lex)
+        match lex.peek():
+            case ",":
+                lex.consume()
+                einsum_second = _parse_spec(lex)
+                lex.expect("->")
+                tensor = _parse_tensor(lex)
+                lex.expect(")")
+                return _construct_expr_from_einsum(child, einsum_second, tensor)
+            case ")":
+                lex.consume()
+                return child
+            case bad:
+                raise ValueError(f"Invalid character {bad}. Expected einsum string or closing paren")
+    else:
+        if lex.peek().isdigit():
+            return _parse_number(lex)
+        return _parse_tensor(lex)
+
+def _parse_term(lex : LexState) -> ExprType:
+    child = _parse_factor(lex)
+    lex.consume_whitespace()
+    match lex.peek():
+        case "*":
+            lex.consume()
+            return BinaryOp(
+                op="*",
+                lhs=child,
+                rhs=_parse_term(lex),
+            )
+        case "/":
+            lex.consume()
+            return BinaryOp(
+                op="/",
+                lhs=child,
+                rhs=_parse_term(lex),
+            )
+        case _:
+            return child
+
+def _parse_spec(lex : LexState) -> ExprType:
+    child = _parse_term(lex)
+    lex.consume_whitespace()
+    match lex.peek():
+        case "+":
+            lex.consume()
+            return BinaryOp(
+                op="+",
+                lhs=child,
+                rhs=_parse_spec(lex),
+            )
+        case "-":
+            if lex.spec.startswith("->"):
+                return child
+
+            lex.consume()
+            return BinaryOp(
+                op="-",
+                lhs=child,
+                rhs=_parse_spec(lex),
+            )
+        case _:
+            return child
+
+def parse_spec_into_expr_type(spec : str) -> ExprType:
+    """
+    Grammar:
+    Spec -> Term + Spec | Term - Spec | Term
+    Term -> Factor * Term | Factor / Term | Factor
+    Factor -> ( Spec ) | ( Spec , Spec -> Tensor ) | Tensor | Number
+    Tensor -> Dim " " Tensor | Dim
+    """
+    lex = LexState(spec)
+    return _parse_spec(lex)
+
+def remap_dims_by_name(dims_by_name : dict[str, Dim], expr : ExprType) -> ExprType:
+    match expr:
+        case Constant(_):
+            return expr
+        case Tensor(_):
+            return expr
+        case BinaryOp(op, lhs, rhs):
+            new_lhs = remap_dims_by_name(dims_by_name, lhs)
+            new_rhs = remap_dims_by_name(dims_by_name, rhs)
+            return BinaryOp(
+                op,
+                new_lhs,
+                new_rhs,
+            )
+        case Repeat(d, child):
+            name = dim_name(d)
+            new_dim = dims_by_name[name] if name in dims_by_name else d
+            new_child = remap_dims_by_name(dims_by_name, child)
+            return Repeat(new_dim, new_child)
+        case Reduce(d, child):
+            name = dim_name(d)
+            new_dim = dims_by_name[name] if name in dims_by_name else d
+            new_child = remap_dims_by_name(dims_by_name, child)
+            return Reduce(new_dim, new_child)
+
+def map_expr_to_dim_type(dim_type : tuple[Dim, ...], expr : ExprType) -> ExprType:
+    dims_by_name = { dim_name(d) : d for d in dim_type }
+    return remap_dims_by_name(dims_by_name, expr)
+
+# TODO: This simplify_expression is SUPER brittle and only has enough functionality to enable example.py
+def simplify_expression(expr : ExprType) -> ExprType:
+    if isinstance(expr, BinaryOp) and expr.op == "+":
+        # The key is that you're only allowed to add reductions of identical subexpressions,
+        # so that means that if you add Reduce[0:5] + Reduce[5:10], you can simplify this to Reduce[0:10]
+        if isinstance(expr.lhs, Reduce) and isinstance(expr.rhs, Reduce):
+            assert dim_full_dim(expr.lhs.dim) == dim_full_dim(expr.rhs.dim)
+            if dim_end(expr.lhs.dim) == dim_start(expr.rhs.dim):
+                combined_dim = simplify_dim(
+                    Sliced(
+                        dim_full_dim(expr.lhs.dim),
+                        dim_start(expr.lhs.dim), dim_end(expr.rhs.dim)
+                    )
+                )
+                remap_dims_by_name({ dim_name(combined_dim) : combined_dim }, expr.lhs.child)
+                return Reduce(combined_dim, expr.lhs.child)
+    return expr
+
+def expr_types_are_equivalent(dim_type : tuple[Dim, ...], expected : ExprType, actual : ExprType) -> bool:
+    exp_mapped = map_expr_to_dim_type(dim_type, expected)
+    act_simp = simplify_expression(actual)
+    return exp_mapped == act_simp
 
 class TypedResult:
-    def __init__(self, *dims, spec : str):
-        pass
+    def __init__(self, spec : str):
+        self.expected_expr_type = parse_spec_into_expr_type(spec)
+        self.expected_dim_type = infer_dims_from_expr(self.expected_expr_type)
+        self.shape = tuple(dim_size(d) for d in self.expected_dim_type)
+        self.arr = np.zeros(self.shape)
+        
+    def assign(self, result : Typed):
+        if not expr_types_are_equivalent(
+                dim_type=result.dim_type,
+                expected=self.expected_expr_type,
+                actual=result.expr_type
+        ):
+            raise ValueError(f"Attempted to assign a tensor that does not match the spec! Expected: {self.expected_expr_type}, actual: {result.expr_type}")
 
-# Declaring dimensions. You shouldn't create duplicate dimensions.
-M, N, K = FullDim('M', 10), FullDim('N', 10), FullDim('K', 10)
-
-# Wrap your numpy arrays inside of the Typed class, and specify their dimensions.
-# This is the type system's entry point into its knowledge about your program.
-a = Typed(a, M, N)
-b = Typed(b, N, K)
-
-# Slice things! a_slice and b_slice are sliced as if we did a[0:5, 0:5] and b[0:5, 0:5]
-a_sliced = a.slice(M, 0, 5).slice(N, 0, 5)
-b_sliced = b.slice(N, 0, 5).slice(K, 0, 5)
-
-# The Typed object has a shape and a type. The type displayed by the `type` accessor is
-# the _DimType_. There is also an _ExprType_, which we will return to later. 
-print("Shape:", a_sliced.shape)
-print("Type: ", a_sliced.type)
-
-# Notice now that we can only perform operations on things with the same type:
-try:
-    a_sliced * b_sliced
-except ValueError as e:
-    pass
-
-# We can actually mix dimensions using einsum! Internally this
-# `repeat`s the dimensions (which is how you introduce new dimensions)
-# and `reduce`s along the reduction dimensions of the einsum.
-# Notice that the returned tile retains the slicing information from the input tensors.
-c_tile0 = einsum(a_sliced, b_sliced, "M N, N K -> M K")
-
-print("Shape:    ", c_tile0.shape)
-print("DimType:  ", c_tile0.type)
-print("ExprType: ", c_tile0.expr_type)
-
-# c = TypedResult(M, K, spec="M N, N K -> M K")
-c = np.zeros((10, 10))
-c = Typed(c, M, K)
-
-tile_size = 5
-for im in range(0, 10, tile_size):
-    for ik in range(0, 10, tile_size):
-        c_accum = None
-        for in_ in range(0, 10, tile_size):
-            tile_a = a.slice(M, im, im + tile_size).slice(N, in_, in_ + tile_size)
-            tile_b = b.slice(N, in_, in_ + tile_size).slice(K, ik, ik + tile_size)
-            tile_c = einsum(tile_a, tile_b, "M N, N K -> M K")
-            c_accum = c_accum + tile_c if c_accum is not None else tile_c
-        c.arr[im:(im+tile_size), ik:(ik+tile_size)] = c_accum.arr
-        print(f"{im=}, {ik=}, {c_accum.expr_type}")
-
-expected = a.arr @ b.arr
-actual = c.arr
-np.testing.assert_allclose(
-    expected,
-    actual,
-)
-print("Passed!")
+        slice_expr = []
+        for d in result.dim_type:
+            ds, de = dim_start(d), dim_end(d)
+            slice_expr.append(slice(ds, de))
+        self.arr[*slice_expr] = result.arr
