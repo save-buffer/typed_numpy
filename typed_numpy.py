@@ -85,27 +85,40 @@ class Typed:
         new_arr = einops.rearrange(self.arr, f"{lhs_str} -> {rhs_str}")
         return Typed(new_arr, *new_dim_type, expr_type=self.expr_type)
 
-    def reduce(self, dim : Dim) -> "Typed":
+    def reduce(self, op : ReduceOpType, dim : Dim) -> "Typed":
         dim = dim_full_dim(dim)
 
         new_dim_type = []
         reduction_dim = None
-        lhs_str = ""
-        rhs_str = ""
-        for d in self.dim_type:
-            name = dim_name(d) + " "
-            lhs_str += name
+        ireduction_dim = None
+        for i, d in enumerate(self.dim_type):
             if dim_name(dim) != dim_name(d):
                 new_dim_type.append(d)
-                rhs_str += name
             else:
+                ireduction_dim = i
                 reduction_dim = d
         if reduction_dim is None:
             raise ValueError(f"Unknown reduction dimension {d}")
+        assert ireduction_dim is not None
+        
+        new_expr_type = Reduce(
+            op=op,
+            dim=reduction_dim,
+            child=self.expr_type
+        )
+        match op:
+            case "sum":
+                new_arr = self.arr.sum(axis=ireduction_dim)
+            case "max":
+                new_arr = self.arr.max(axis=ireduction_dim)
 
-        new_expr_type = Reduce(reduction_dim, self.expr_type)
-        new_arr = einops.einsum(self.arr, f"{lhs_str} -> {rhs_str}")
         return Typed(new_arr, *new_dim_type, expr_type=new_expr_type)
+
+    def sum(self, dim : Dim) -> "Typed":
+        return self.reduce("sum", dim)
+
+    def max(self, dim : Dim) -> "Typed":
+        return self.reduce("max", dim)
 
     def binary_op(self, other, op : BinaryOpType) -> "Typed":
         return _binary_op_helper(self, other, op)
@@ -153,6 +166,8 @@ def _binary_op_helper(slf, other, op):
                     new_arr = slf.arr * other.arr
                 case "/":
                     new_arr = slf.arr / other.arr
+                case "max":
+                    new_arr = np.max(slf.arr, other.arr)
 
             new_dim_type = slf.dim_type
             new_expr_type = BinaryOp(
@@ -171,6 +186,8 @@ def _binary_op_helper(slf, other, op):
                     new_arr = slf.arr * x
                 case "/":
                     new_arr = slf.arr / x
+                case "max":
+                    new_arr = np.max(slf.arr, other.arr)
 
             new_dim_type = slf.dim_type
             new_expr_type = BinaryOp(
@@ -236,9 +253,43 @@ def einsum(a : Typed, b : Typed, einstr : str) -> Typed:
     c = a * b
 
     for d in reduction_dims:
-        c = c.reduce(d)
+        c = c.sum(d)
 
     return c
+
+def exp(x : Typed) -> Typed:
+    new_dim_type = x.dim_type
+    new_expr_type = UnaryOp(
+        op="exp",
+        child=x.expr_type,
+    )
+    new_arr = np.exp(x.arr)
+    return Typed(new_arr, *new_dim_type, expr_type=new_expr_type)
+
+
+def sin(x : Typed) -> Typed:
+    new_dim_type = x.dim_type
+    new_expr_type = UnaryOp(
+        op="sin",
+        child=x.expr_type,
+    )
+    new_arr = np.sin(x.arr)
+    return Typed(new_arr, *new_dim_type, expr_type=new_expr_type)
+
+
+def cos(x : Typed) -> Typed:
+    new_dim_type = x.dim_type
+    new_expr_type = UnaryOp(
+        op="cos",
+        child=x.expr_type,
+    )
+    new_arr = np.cos(x.arr)
+    return Typed(new_arr, *new_dim_type, expr_type=new_expr_type)
+    
+
+def max(x : Typed, y : Typed) -> Typed:
+    return _binary_op_helper(x, y, "max")
+
 
 @dataclass
 class LexState:
@@ -283,7 +334,7 @@ def infer_dims_from_expr(expr : ExprType) -> tuple[FullDim, ...] | None:
             dims = infer_dims_from_expr(child)
             assert dims is not None
             return (dim_full_dim(along), *dims)
-        case Reduce(along, child):
+        case Reduce(_, along, child):
             dims = infer_dims_from_expr(child)
             assert dims is not None
             along_full = dim_full_dim(along)
@@ -321,7 +372,7 @@ def _construct_expr_from_einsum(a : ExprType, b : ExprType, rhs : Tensor) -> Exp
         rhs=b,
     )
     for d in reduction_dims:
-        c = Reduce(d, c)
+        c = Reduce("sum", d, c)
 
     return c
 
@@ -444,6 +495,12 @@ def remap_dims_by_name(dims_by_name : dict[str, Dim], expr : ExprType) -> ExprTy
             return expr
         case Tensor(_):
             return expr
+        case UnaryOp(op, child):
+            new_child = remap_dims_by_name(dims_by_name, child)
+            return UnaryOp(
+                op,
+                new_child,
+            )
         case BinaryOp(op, lhs, rhs):
             new_lhs = remap_dims_by_name(dims_by_name, lhs)
             new_rhs = remap_dims_by_name(dims_by_name, rhs)
@@ -457,34 +514,15 @@ def remap_dims_by_name(dims_by_name : dict[str, Dim], expr : ExprType) -> ExprTy
             new_dim = dims_by_name[name] if name in dims_by_name else d
             new_child = remap_dims_by_name(dims_by_name, child)
             return Repeat(new_dim, new_child)
-        case Reduce(d, child):
+        case Reduce(op, d, child):
             name = dim_name(d)
             new_dim = dims_by_name[name] if name in dims_by_name else d
             new_child = remap_dims_by_name(dims_by_name, child)
-            return Reduce(new_dim, new_child)
+            return Reduce(op, new_dim, new_child)
 
 def map_expr_to_dim_type(dim_type : tuple[Dim, ...], expr : ExprType) -> ExprType:
     dims_by_name = { dim_name(d) : d for d in dim_type }
     return remap_dims_by_name(dims_by_name, expr)
-
-# TODO: This simplify_expression is SUPER brittle and only has enough functionality to enable example.py
-def simplify_expression(expr : ExprType) -> ExprType:
-    if isinstance(expr, BinaryOp) and expr.op == "+":
-        # The key is that you're only allowed to add reductions of identical subexpressions,
-        # so that means that if you add Reduce[0:5] + Reduce[5:10], you can simplify this to Reduce[0:10]
-        if isinstance(expr.lhs, Reduce) and isinstance(expr.rhs, Reduce):
-            assert dim_full_dim(expr.lhs.dim) == dim_full_dim(expr.rhs.dim)
-            if dim_end(expr.lhs.dim) == dim_start(expr.rhs.dim):
-                combined_dim = simplify_dim(
-                    Sliced(
-                        dim_full_dim(expr.lhs.dim),
-                        dim_start(expr.lhs.dim),
-                        dim_end(expr.rhs.dim)
-                    )
-                )
-                remap_dims_by_name({ dim_name(combined_dim) : combined_dim }, expr.lhs.child)
-                return Reduce(combined_dim, expr.lhs.child)
-    return expr
 
 def expr_types_are_equivalent(dim_type : tuple[Dim, ...], expected : ExprType, actual : ExprType) -> bool:
     expected = map_expr_to_dim_type(dim_type, expected)

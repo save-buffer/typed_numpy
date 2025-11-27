@@ -44,12 +44,40 @@ class EnodeType(Enum):
     Constant = "Constant"
     Dimension = "Dimension"
     Tensor = "Tensor"
+    Exp = "Exp"
+    Sin = "Sin"
+    Cos = "Cos"
     Add = "+"
     Sub = "-"
     Mul = "*"
     Div = "/"
+    BinaryMax = "BinaryMax"
     Repeat = "Repeat"
-    Reduce = "Reduce"
+    Sum = "Sum"
+    Max = "Max"
+
+def enode_type_from_unary_op(x : UnaryOpType):
+    match x:
+        case "exp":
+            return EnodeType.Exp
+        case "sin":
+            return EnodeType.Sin
+        case "cos":
+            return EnodeType.Cos
+
+def enode_type_from_binary_op(x : BinaryOpType):
+    match x:
+        case "+" | "-" | "*" | "/":
+            return EnodeType(x)
+        case "max":
+            return EnodeType.BinaryMax
+
+def enode_type_from_reduce_op(x : ReduceOpType):
+    match x:
+        case "sum":
+            return EnodeType.Sum
+        case "max":
+            return EnodeType.Max
 
 @dataclass(frozen=True)
 class Enode:
@@ -182,18 +210,25 @@ class Egraph:
         return False
 
     def _combine_reductions(self, id : EclassID, enode : Enode) -> bool:
-        # reduce(x, y) + reduce(y, z) = reduce(x, z)
-        if enode.op != EnodeType.Add:
-            return False
+        # sum[x:y] + sum[y:z] = sum(x:z) or binary_max(max[x:y], max[y:z]) = max[x:z]
+        match enode.op:
+            case EnodeType.Add:
+                expected_child_op = EnodeType.Sum
+            case EnodeType.BinaryMax:
+                expected_child_op = EnodeType.Max
+            case _:
+                return False
+
         lhs, rhs = enode.args
         lhs_enodes = self.get_enodes(lhs)
         rhs_enodes = self.get_enodes(rhs)
         for lhs_enode in lhs_enodes:
-            if lhs_enode.op != EnodeType.Reduce:
+            if lhs_enode.op != expected_child_op:
                 continue
             lhs_dim, lhs_child = lhs_enode.args
+
             for rhs_enode in rhs_enodes:
-                if rhs_enode.op != EnodeType.Reduce:
+                if rhs_enode.op != expected_child_op:
                     continue
                 rhs_dim, rhs_child = rhs_enode.args
                 if (
@@ -210,7 +245,7 @@ class Egraph:
                     )
                     combined = self.add(
                         Enode(
-                            op=EnodeType.Reduce,
+                            op=expected_child_op,
                             args=(combined_dim, lhs_child),
                         )
                     )
@@ -220,18 +255,22 @@ class Egraph:
         return False
 
     def _mul_or_div_into_reduction_or_repeat(self, id : EclassID, enode : Enode) -> bool:
-        # reduce(x / c) = reduce(x) / c
+        # sum(x / c) = sum(x) / c, or max(x / c) = max(x) / c if c >= 0
         if enode.op not in (EnodeType.Mul, EnodeType.Div):
             return False
         lhs, rhs = enode.args
         lhs_enodes = self.get_enodes(lhs)
         rhs_enodes = self.get_enodes(rhs)
         for lhs_enode in lhs_enodes:
-            if lhs_enode.op not in (EnodeType.Repeat, EnodeType.Reduce):
+            if lhs_enode.op not in (EnodeType.Repeat, EnodeType.Sum, EnodeType.Max):
                 continue
 
             for rhs_enode in rhs_enodes:
                 if rhs_enode.op != EnodeType.Constant:
+                    continue
+
+                val, = rhs_enode.args
+                if lhs_enode.op == EnodeType.Max and val < 0:
                     continue
 
                 lhs_dim, lhs_child = lhs_enode.args
@@ -253,8 +292,8 @@ class Egraph:
         return False
 
     def _mul_or_div_out_of_reduction_or_repeat(self, id : EclassID, enode : Enode) -> bool:
-        # reduce(x / c) = reduce(x) / c
-        if enode.op not in (EnodeType.Repeat, EnodeType.Reduce):
+        # sum(x / c) = sum(x) / c, or max(x / c) = max(x) / c if c >= 0
+        if enode.op not in (EnodeType.Repeat, EnodeType.Sum, EnodeType.Max):
             return False
 
         dim, child = enode.args
@@ -267,6 +306,10 @@ class Egraph:
             for child_rhs_enode in child_rhs_enodes:
                 if child_rhs_enode.op != EnodeType.Constant:
                     continue
+                val, = child_rhs_enode.args
+                if enode.op == EnodeType.Max and val < 0:
+                    continue
+
                 new_inner = self.add(
                     Enode(
                         op=enode.op,
@@ -404,11 +447,18 @@ class Egraph:
                     args=(dims,),
                 )
                 return self.add(enode)
+            case UnaryOp(op, child):
+                child_id = self.insert_expression(child)
+                enode = Enode(
+                    op=enode_type_from_unary_op(op),
+                    args=(child,),
+                )
+                return self.add(enode)
             case BinaryOp(op, lhs, rhs):
                 lhs_id = self.insert_expression(lhs)
                 rhs_id = self.insert_expression(rhs)
                 enode = Enode(
-                    op=EnodeType(op),
+                    op=enode_type_from_binary_op(op),
                     args=(lhs_id, rhs_id),
                 )
                 return self.add(enode)
@@ -419,10 +469,10 @@ class Egraph:
                     args=(dim, child_id),
                 )
                 return self.add(enode)
-            case Reduce(dim, child):
+            case Reduce(op, dim, child):
                 child_id = self.insert_expression(child)
                 enode = Enode(
-                    op=EnodeType.Reduce,
+                    op=enode_type_from_reduce_op(op),
                     args=(dim, child_id),
                 )
                 return self.add(enode)

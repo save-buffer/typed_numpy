@@ -81,6 +81,7 @@ for im in range(0, 10, tile_size):
         # to the specification, we would not be able to assign here. For instance, if our dimensions
         # were mismatching, or we failed to reduce the entire dimension, or if we accidentally multiplied
         # by 2. 
+        assert c_accum is not None # Make typechecker happy
         c.assign(c_accum)
 
 # Now we can get our result from c.arr

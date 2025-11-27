@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from typing import Literal
+from enum import Enum
 
 g_dim_registry : dict[str, "FullDim"] = {}
 
@@ -94,7 +95,14 @@ class Constant:
 class Tensor:
     dims : tuple[FullDim, ...]
 
-BinaryOpType = Literal["+", "-", "*", "/"]
+UnaryOpType = Literal["exp", "sin", "cos"]
+
+@dataclass(frozen=True)
+class UnaryOp:
+    op : UnaryOpType
+    child : "ExprType"
+
+BinaryOpType = Literal["+", "-", "*", "/", "max"]
 
 @dataclass(frozen=True)
 class BinaryOp:
@@ -107,10 +115,13 @@ class Repeat:
     dim : Dim
     child : "ExprType"
 
+ReduceOpType = Literal["sum", "max"]
+
 @dataclass(frozen=True)
 class Reduce:
+    op : ReduceOpType
     dim : Dim
     child : "ExprType"
 
-ExprType = Constant | Tensor | BinaryOp | Repeat | Reduce
+ExprType = Constant | Tensor | UnaryOp | BinaryOp | Repeat | Reduce
 
