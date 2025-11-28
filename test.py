@@ -39,9 +39,23 @@ def test_basic_matmul():
             assert c_accum is not None
             c.assign(c_accum)
 
+def test_exp():
+    M, N = FullDim('M', 10), FullDim('N', 10)
+    a = Typed(np.random.randn(10, 10), M, N)
+    c = TypedResult("exp(M N)")
+    
+    a_exped = exp(a)
+    c.assign(a_exped)
+    np.testing.assert_allclose(
+        c.arr,
+        np.exp(a.arr),
+    )
+
+
 tests = [
     test_simple_expression,
     test_basic_matmul,
+    test_exp,
 ]
 
 if __name__ == '__main__':

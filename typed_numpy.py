@@ -1,3 +1,4 @@
+import dataclasses
 from dataclasses import dataclass
 from typing import Literal
 
@@ -296,11 +297,23 @@ def max(x : Typed, y : Typed) -> Typed:
 class LexState:
     spec : str
 
-    def peek(self) -> str | None:
-        return self.spec[0] if self.spec else None
-
     def consume_whitespace(self):
         self.spec = self.spec.strip()
+
+    def peek(self) -> str | None:
+        self.consume_whitespace()
+        return self.spec[0] if self.spec else None
+
+    def maybe_consume(self, *args) -> str | None:
+        self.consume_whitespace()
+        for a in args:
+            if self.spec.startswith(a):
+                self.spec = self.spec[len(a):]
+                return a
+        return None
+
+    def startswith(self, s):
+        return self.spec.startswith(s)
 
     def consume(self) -> str | None:
         self.consume_whitespace()
@@ -343,21 +356,19 @@ def infer_dims_from_expr(expr : ExprType) -> tuple[FullDim, ...] | None:
             along_full = dim_full_dim(along)
             return tuple(d for d in dims if d != along_full)
 
-
-def _construct_expr_from_einsum(a : ExprType, b : ExprType, rhs : Tensor) -> ExprType:
-    dims_a = infer_dims_from_expr(a)
-    dims_b = infer_dims_from_expr(b)
-    dims_rhs = rhs.dims
-
-    assert dims_a is not None
-    assert dims_b is not None
-
+def _construct_binary_reduction_expr(
+    a_type : tuple[DimType, ExprType],
+    b_type : tuple[DimType, ExprType],
+    rhs : DimType,
+) -> ExprType:
+    dims_a, expr_a = a_type
+    dims_b, expr_b = b_type
     a_dims_by_name = { dim_name(d) : d for d in dims_a }
     b_dims_by_name = { dim_name(d) : d for d in dims_b }
-    rhs_dim_names = { dim_name(d) for d in rhs.dims }
+    rhs_dim_names = { dim_name(d) for d in rhs }
 
     common_dims = a_dims_by_name.keys() & b_dims_by_name.keys()
-    a_repeated, b_repeated = a, b
+    a_repeated, b_repeated = expr_a, expr_b
     for name, d in b_dims_by_name.items():
         if name not in common_dims:
             a_repeated = Repeat(d, a_repeated)
@@ -365,7 +376,7 @@ def _construct_expr_from_einsum(a : ExprType, b : ExprType, rhs : Tensor) -> Exp
     for name, d in a_dims_by_name.items():
         if name not in common_dims:
             b_repeated = Repeat(d, b_repeated)
-    a, b = a_repeated, b_repeated 
+    a, b = a_repeated, b_repeated
     
     reduction_dims = [a_dims_by_name[name] for name in common_dims if name not in rhs_dim_names]
 
@@ -379,37 +390,20 @@ def _construct_expr_from_einsum(a : ExprType, b : ExprType, rhs : Tensor) -> Exp
 
     return c
 
-def _parse_dim(lex : LexState) -> FullDim:
-    lex.consume_whitespace()
-    i = 0
-    while i < len(lex.spec) and lex.spec[i].isalpha():
-        i += 1
+def _construct_unary_reduction_expr(
+    a : tuple[DimType, ExprType],
+    rhs : DimType,
+) -> ExprType:
+    dims_a, expr_a = a
+    a_dims_by_name = { dim_name(d) : d for d in dims_a }
+    rhs_dim_names = { dim_name(d) for d in rhs }
+    reduction_dims = a_dims_by_name.keys() & rhs_dim_names
 
-    dim_name = lex.spec[:i]
-    lex.spec = lex.spec[i:]
-    if dim_name not in g_dim_registry:
-        breakpoint()
-        raise ValueError(f"Parsed dim {dim_name} is not a known dimension!")
-    return g_dim_registry[dim_name]
+    result = expr_a
+    for d in reduction_dims:
+        result = Reduce("sum", d, result)
+    return result
 
-def _parse_tensor(lex : LexState) -> Tensor:
-    dims = []
-    while True:
-        dims.append(_parse_dim(lex))
-        lex.consume_whitespace()
-        nxt = lex.peek()
-        if nxt is None or not nxt.isalpha():
-            return Tensor(tuple(dims))
-
-def _parse_number(lex : LexState) -> Constant:
-    lex.consume_whitespace()
-    i = 0
-    while i < len(lex.spec) and (lex.spec[i].isdigit() or lex.spec[i] == '.'):
-        i += 1
-    
-    constant = float(lex.spec[:i])
-    lex.spec = lex.spec[i:]
-    return Constant(constant)
 
 def _normalize_dts_for_binary_op(lhs : DimType, rhs : DimType) -> DimType:
     if lhs == tuple():
@@ -420,89 +414,161 @@ def _normalize_dts_for_binary_op(lhs : DimType, rhs : DimType) -> DimType:
         raise ValueError("Invalid spec: mismatching DimTypes for binary operation")
     return lhs
 
-def _parse_factor(lex : LexState) -> tuple[DimType, ExprType]:
+def _parse_number(lex : LexState) -> tuple[DimType, ExprType]:
     lex.consume_whitespace()
-    if lex.peek() == "(":
-        lex.consume()
-        child_dt, child_et = _parse_spec(lex)
-        match lex.peek():
-            case ",":
-                lex.consume()
-                _, einsum_second = _parse_spec(lex)
-                lex.expect("->")
-                tensor = _parse_tensor(lex)
-                lex.expect(")")
-                return tensor.dims, _construct_expr_from_einsum(child_et, einsum_second, tensor)
-            case ")":
-                lex.consume()
-                return child_dt, child_et
-            case bad:
-                raise ValueError(f"Invalid character {bad}. Expected einsum string or closing paren")
+    i = 0
+    while i < len(lex.spec) and (lex.spec[i].isdigit() or lex.spec[i] == '.'):
+        i += 1
+    
+    constant = float(lex.spec[:i])
+    lex.spec = lex.spec[i:]
+    return tuple(), Constant(constant)
+
+def _parse_dim(lex : LexState) -> FullDim:
+    lex.consume_whitespace()
+    i = 0
+    while i < len(lex.spec) and lex.spec[i].isalpha():
+        i += 1
+
+    dim_name = lex.spec[:i]
+    lex.spec = lex.spec[i:]
+    if dim_name not in g_dim_registry:
+        raise ValueError(f"Parsed dim {dim_name} is not a known dimension!")
+    return g_dim_registry[dim_name]
+
+def _parse_tensor(lex : LexState) -> tuple[DimType, ExprType]:
+    dims = []
+    while (nxt := lex.peek()) is not None and nxt.isalpha():
+        d = _parse_dim(lex)
+        dims.append(d)
+    return tuple(dims), Tensor(tuple(dims))
+
+def _parse_contraction(lex : LexState) -> tuple[DimType, ExprType]:
+    lhs_dt, lhs_et = _parse_spec(lex)
+    if lex.maybe_consume(','):
+        rhs_dt, rhs_et = _parse_spec(lex)
+        lex.expect('->')
+        result_dt, _ = _parse_tensor(lex)
+        return result_dt, _construct_binary_reduction_expr(
+            (lhs_dt, lhs_et),
+            (rhs_dt, rhs_et),
+            result_dt,
+        )
+    elif lex.maybe_consume('->'):
+        result_dt, _ = _parse_tensor(lex)
+        return result_dt, _construct_unary_reduction_expr(
+            (lhs_dt, lhs_et),
+            result_dt,
+        )
     else:
-        nxt = lex.peek()
-        if nxt is None:
-            raise ValueError("End of input while parsing expression")
-        if nxt.isdigit():
-            return tuple(), _parse_number(lex)
-        tensor = _parse_tensor(lex)
-        return tensor.dims, tensor
+        raise ValueError("Expected , for binary reduction or -> for unary reduction")
+
+def _parse_paren_expr(lex : LexState) -> tuple[DimType, ExprType]:
+    lhs_dt, lhs_et = _parse_spec(lex)
+    if lex.maybe_consume(','):
+        rhs_dt, rhs_et = _parse_spec(lex)
+        lex.expect('->')
+        result_dt, _ = _parse_tensor(lex)
+        return result_dt, _construct_binary_reduction_expr(
+            (lhs_dt, lhs_et),
+            (rhs_dt, rhs_et),
+            result_dt,
+        )
+    elif lex.maybe_consume('->'):
+        result_dt, _ = _parse_tensor(lex)
+        return result_dt, _construct_unary_reduction_expr(
+            (lhs_dt, lhs_et),
+            result_dt,
+        )
+    else:
+        return lhs_dt, lhs_et
+    
+def _parse_primary(lex : LexState) -> tuple[DimType, ExprType]:
+    if lex.peek() == '(':
+        lex.consume()
+        dt, et = _parse_paren_expr(lex)
+        lex.expect(')')
+        return dt, et
+    elif (nxt := lex.peek()) is not None:
+        if nxt.isalpha():
+            return _parse_tensor(lex)
+        elif nxt.isdigit():
+            return _parse_number(lex)
+    raise ValueError("Parenthesized expression, tensor, or number expected")
+
+def _parse_factor(lex : LexState) -> tuple[DimType, ExprType]:
+    if reduction := lex.maybe_consume("sum", "max"):
+        lex.expect('(')
+        dt, et = _parse_contraction(lex)
+        lex.expect(')')
+        assert isinstance(et, Reduce)
+        et = dataclasses.replace(et, op=reduction)
+        return dt, et
+    elif unary_op := lex.maybe_consume("exp", "sin", "cos"):
+        lex.expect('(')
+        dt, et = _parse_spec(lex)
+        lex.expect(')')
+        return dt, UnaryOp(
+            op=unary_op,
+            child=et,
+        )
+    else:
+        return _parse_primary(lex)
 
 def _parse_term(lex : LexState) -> tuple[DimType, ExprType]:
-    child_dt, child_et = _parse_factor(lex)
-    lex.consume_whitespace()
-    match nxt := lex.peek():
-        case "*"  | "/":
-            lex.consume()
-            rhs_dt, rhs_et = _parse_term(lex)
+    result_dt, result_et = _parse_factor(lex)
+    while op := lex.maybe_consume("*", "/"):
+        rhs_dt, rhs_et = _parse_factor(lex)
+        result_dt = _normalize_dts_for_binary_op(result_dt, rhs_dt)
+        result_et = BinaryOp(
+            op=op,
+            lhs=result_et,
+            rhs=rhs_et,
+        )
+    return result_dt, result_et
 
-            dimtype = _normalize_dts_for_binary_op(child_dt, rhs_dt)
-
-            return dimtype, BinaryOp(
-                op=nxt,
-                lhs=child_et,
-                rhs=rhs_et,
-            )
-        case _:
-            return child_dt, child_et
+def _parse_expr(lex : LexState) -> tuple[DimType, ExprType]:
+    result_dt, result_et = _parse_term(lex)
+    while not lex.startswith("->") and (op := lex.maybe_consume('+', '-')):
+        rhs_dt, rhs_et = _parse_term(lex)
+        result_dt = _normalize_dts_for_binary_op(result_dt, rhs_dt)
+        result_et = BinaryOp(
+            op=op,
+            lhs=result_et,
+            rhs=rhs_et,
+        )
+    
+    return result_dt, result_et    
 
 def _parse_spec(lex : LexState) -> tuple[DimType, ExprType]:
-    child_dt, child_et = _parse_term(lex)
-    lex.consume_whitespace()
-    match lex.peek():
-        case "+":
-            lex.consume()
-            rhs_dt, rhs_et = _parse_spec(lex)
-            dimtype = _normalize_dts_for_binary_op(child_dt, rhs_dt)
-
-            return dimtype, BinaryOp(
-                op="+",
-                lhs=child_et,
-                rhs=rhs_et,
-            )
-        case "-":
-            if lex.spec.startswith("->"):
-                return child_dt, child_et
-
-            lex.consume()
-
-            rhs_dt, rhs_et = _parse_spec(lex)
-            dimtype = _normalize_dts_for_binary_op(child_dt, rhs_dt)
-
-            return dimtype, BinaryOp(
-                op="-",
-                lhs=child_et,
-                rhs=rhs_et,
-            )
-        case _:
-            return child_dt, child_et
+    return _parse_expr(lex)
 
 def parse_spec_into_type(spec : str) -> tuple[DimType, ExprType]:
     """
     Grammar:
-    Spec -> Term + Spec | Term - Spec | Term
-    Term -> Factor * Term | Factor / Term | Factor
-    Factor -> ( Spec ) | ( Spec , Spec -> Tensor ) | Tensor | Number
-    Tensor -> Dim " " Tensor | Dim
+    Spec      -> Expr
+    Expr      -> Term Expr'
+    Expr'     -> '+' Term Expr' | '-' Term Expr' | ε
+
+    Term      -> Factor Term'
+    Term'     -> '*' Factor Term' | '/' Factor Term' | ε
+
+    Factor    -> REDUCE_OP '(' Contraction ')' | UNARY_FN '(' Spec ')' | Primary
+    Primary   -> '(' ParenExpr ')' | Tensor | Number
+
+    ParenExpr -> Spec ParenExpr'
+    ParenExpr'-> ',' Spec '->' Tensor | '->' Tensor | ε
+
+    Contraction -> Spec Contraction'
+    Contraction'-> ',' Spec '->' Tensor | '->' Tensor
+
+    Tensor    -> DIM Tensor'
+    Tensor'   -> DIM Tensor' | ε
+
+    DIM       -> [A-Z][a-z0-9]*
+    Number    -> [0-9]+ ('.' [0-9]+)?
+    UNARY_FN  -> 'exp' | 'sin' | 'cos'
+    REDUCE_OP -> 'sum' | 'max' | 'min' | 'prod'
     """
     lex = LexState(spec)
     return _parse_spec(lex)
