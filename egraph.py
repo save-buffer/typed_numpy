@@ -1,3 +1,5 @@
+import math
+
 from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum
@@ -47,6 +49,7 @@ class EnodeType(Enum):
     Exp = "Exp"
     Sin = "Sin"
     Cos = "Cos"
+    Sqrt = "Sqrt"
     Add = "+"
     Sub = "-"
     Mul = "*"
@@ -98,7 +101,13 @@ class Egraph:
             self._combine_reductions,
             self._mul_or_div_into_reduction_or_repeat,
             self._mul_or_div_out_of_reduction_or_repeat,
-            self._constant_folding,
+            self._mul_by_zero,
+            self._div_by_one,
+            self._sub_or_div_by_self,
+            self._identity,
+            self._constant_folding_unary,
+            self._constant_folding_binary,
+            self._decompose_exp,
         ]
 
     def _commutativity(self, id : EclassID, enode : Enode) -> bool:
@@ -327,7 +336,133 @@ class Egraph:
                     return True
         return False
 
-    def _constant_folding(self, id : EclassID, enode : Enode) -> bool:
+    def _mul_by_zero(self, id : EclassID, enode : Enode) -> bool:
+        if enode.op != EnodeType.Mul:
+            return False
+
+        lhs, rhs = enode.args
+        rhs_enodes = self.get_enodes(rhs)
+        for rhs_enode in rhs_enodes:
+            if rhs_enode.op == EnodeType.Constant:
+                break
+        if rhs_enode != EnodeType.Constant:
+            return False
+        val, = rhs_enode.args
+        if val != 0:
+            return False
+        if not self.equivalent(id, rhs):
+            self.merge(id, rhs)
+            return True
+        return False
+
+    def _div_by_one(self, id : EclassID, enode : Enode) -> bool:
+        if enode.op != EnodeType.Div:
+            return False
+
+        lhs, rhs = enode.args
+        rhs_enodes = self.get_enodes(rhs)
+        for rhs_enode in rhs_enodes:
+            if rhs_enode.op == EnodeType.Constant:
+                break
+        if rhs_enode != EnodeType.Constant:
+            return False
+        val, = rhs_enode.args
+        if val != 1:
+            return False
+        if not self.equivalent(id, rhs):
+            self.merge(id, rhs)
+            return True
+        return False
+
+    def _sub_or_div_by_self(self, id : EclassID, enode : Enode) -> bool:
+        if enode.op not in (EnodeType.Sub, EnodeType.Div):
+            return False
+        lhs, rhs = enode.args
+        if not self.equivalent(lhs, rhs):
+            return False
+
+        match enode.op:
+            case EnodeType.Sub:
+                new_val = 0.0
+            case EnodeType.Div:
+                new_val = 1.0
+        new_constant = self.add(
+            Enode(
+                EnodeType.Constant,
+                args=(new_val,),
+            )
+        )
+        if not self.equivalent(id, new_constant):
+            self.merge(id, new_constant)
+            return True
+        return False
+
+        
+    def _identity(self, id : EclassID, enode : Enode) -> bool:
+        if enode.op not in (EnodeType.Add, EnodeType.Sub, EnodeType.Mul, EnodeType.Div):
+            return False
+        
+        lhs, rhs = enode.args
+        rhs_enodes = self.get_enodes(rhs)
+        for rhs_enode in rhs_enodes:
+            if rhs_enode.op == EnodeType.Constant:
+                break
+        if rhs_enode.op != EnodeType.Constant:
+            return False
+
+        val, = rhs_enode.args
+        match enode.op:
+            case EnodeType.Add | EnodeType.Sub:
+                if val != 0:
+                    return False
+            case EnodeType.Mul | EnodeType.Div:
+                if val != 1:
+                    return False
+        if not self.equivalent(id, lhs):
+            self.merge(id, lhs)
+            return True
+        return False
+
+    def _constant_folding_unary(self, id : EclassID, enode : Enode) -> bool:
+        if enode.op not in (EnodeType.Exp, EnodeType.Sin, EnodeType.Cos, EnodeType.Sqrt):
+            return False
+
+        my_enodes = self.get_enodes(id)
+        for my_enode in my_enodes:
+            if my_enode.op == EnodeType.Constant:
+                return False
+
+        child, = enode.args
+        child_enodes = self.get_enodes(child)
+        for child_enode in child_enodes:
+            if child_enode.op == EnodeType.Constant:
+                break
+        if child_enode.op != EnodeType.Constant:
+            return False
+
+        val, = child_enode.args
+        match enode.op:
+            case EnodeType.Exp:
+                new_val = math.exp(val)
+            case EnodeType.Sin:
+                new_val = math.sin(val)
+            case EnodeType.Cos:
+                new_val = math.cos(val)
+            case EnodeType.Sqrt:
+                new_val = math.sqrt(val)
+        new_const = self.add(
+            Enode(
+                op=EnodeType.Constant,
+                args=(new_val,),
+            )
+        )
+        if not self.equivalent(id, new_const):
+            self.merge(id, new_const)
+            return True
+        return False
+
+
+    def _constant_folding_binary(self, id : EclassID, enode : Enode) -> bool:
         if enode.op not in (EnodeType.Add, EnodeType.Sub, EnodeType.Mul, EnodeType.Div):
             return False
 
@@ -374,6 +509,48 @@ class Egraph:
             self.merge(id, new_const)
             return True
         return False
+
+    def _decompose_exp(self, id : EclassID, enode : Enode) -> bool:
+        if enode.op != EnodeType.Exp:
+            return False
+        child, = enode.args
+        child_enodes = self.get_enodes(child)
+        for child_enode in child_enodes:
+            if child_enode.op in (EnodeType.Add, EnodeType.Sub):
+                continue
+        if child_enode.op not in (EnodeType.Add, EnodeType.Sub):
+            return False
+        
+        lhs, rhs = child_enode.args
+        exp_lhs = self.add(
+            Enode(
+                op=EnodeType.Exp,
+                args=(lhs,),
+            )
+        )
+        exp_rhs = self.add(
+            Enode(
+                op=EnodeType.Exp,
+                args=(rhs,),
+            )
+        )
+        match child_enode.op:
+            case EnodeType.Add:
+                new_op = EnodeType.Mul
+            case EnodeType.Sub:
+                new_op = EnodeType.Div
+
+        combined = self.add(
+            Enode(
+                op=new_op,
+                args=(exp_lhs, exp_rhs),
+            )
+        )
+        if not self.equivalent(id, combined):
+            self.merge(id, combined)
+            return True
+        return False
+
 
     def _canonicalize(self, enode : Enode) -> Enode:
         canonicalized_args = tuple(
@@ -451,7 +628,7 @@ class Egraph:
                 child_id = self.insert_expression(child)
                 enode = Enode(
                     op=enode_type_from_unary_op(op),
-                    args=(child,),
+                    args=(child_id,),
                 )
                 return self.add(enode)
             case BinaryOp(op, lhs, rhs):
@@ -485,19 +662,34 @@ class Egraph:
                 return True
         return False
 
-    def apply_rewrites(self, max_iters : int = 10):
+    def apply_rewrites(self) -> int:
+        nmerges = 0
+        all_enodes = []
+        for eclass_id in self.eclasses.keys():
+            enodes = self.get_enodes(eclass_id)
+            for enode in enodes:
+                all_enodes.append((eclass_id, enode))
+
+        for eclass_id, enode in all_enodes:
+            nmerges += 1 if self._apply_rules_to_enode(eclass_id, enode) else 0
+        return nmerges
+
+    def incrementally_check_equivalence(self, x : EclassID, y : EclassID, max_iters : int = 10) -> bool:
         total_merges = 0
         for i in range(max_iters):
-            merges_this_iter = 0
-            all_enodes = []
-            for eclass_id in self.eclasses.keys():
-                enodes = self.get_enodes(eclass_id)
-                for enode in enodes:
-                    all_enodes.append((eclass_id, enode))
-
-            for eclass_id, enode in all_enodes:
-                merges_this_iter += 1 if self._apply_rules_to_enode(eclass_id, enode) else 0
-
+            merges_this_iter = self.apply_rewrites()
+            print(f"Iter {i} did {merges_this_iter} merges, {len(self.enodes)} enodes")            
+            total_merges += merges_this_iter
+            
+            if self.equivalent(x, y):
+                return True
+        return False
+        
+    def equality_saturation(self, max_iters : int = 10):
+        total_merges = 0
+        for i in range(max_iters):
+            merges_this_iter = self.apply_rewrites()
+            print(f"Iter {i} did {merges_this_iter} merges, {len(self.enodes)} enodes")
             total_merges += merges_this_iter
             if merges_this_iter == 0:
                 break

@@ -60,7 +60,7 @@ class Typed:
             new_dim_type.append(d)
 
         nrepeats = dim_size(dim)
-        repeated_arr = self.arr[None, :, :].repeat(nrepeats, axis=0)
+        repeated_arr = self.arr[None].repeat(nrepeats, axis=0)
         new_expr_type = Repeat(dim, self.expr_type)
         return Typed(repeated_arr, *new_dim_type, expr_type=new_expr_type)
 
@@ -133,7 +133,19 @@ class Typed:
     def __mul__(self, other) -> "Typed":
         return self.binary_op(other, "*")
 
-    def __div__(self, other) -> "Typed":
+    def __truediv__(self, other) -> "Typed":
+        return self.binary_op(other, "/")
+
+    def __fadd__(self, other) -> "Typed":
+        return self.binary_op(other, "+")
+
+    def __rsub__(self, other) -> "Typed":
+        return self.binary_op(other, "-")
+
+    def __rmul__(self, other) -> "Typed":
+        return self.binary_op(other, "*")
+
+    def __rtruediv__(self, other) -> "Typed":
         return self.binary_op(other, "/")
 
     def __matmul__(self, other) -> "Typed":
@@ -168,7 +180,7 @@ def _binary_op_helper(slf, other, op):
                 case "/":
                     new_arr = slf.arr / other.arr
                 case "max":
-                    new_arr = np.max(slf.arr, other.arr)
+                    new_arr = np.maximum(slf.arr, other.arr)
 
             new_dim_type = slf.dim_type
             new_expr_type = BinaryOp(
@@ -188,7 +200,7 @@ def _binary_op_helper(slf, other, op):
                 case "/":
                     new_arr = slf.arr / x
                 case "max":
-                    new_arr = np.max(slf.arr, other.arr)
+                    new_arr = np.maximum(slf.arr, x)
 
             new_dim_type = slf.dim_type
             new_expr_type = BinaryOp(
@@ -258,7 +270,6 @@ def einsum(a : Typed, b : Typed, einstr : str) -> Typed:
 
     return c
 
-
 def exp(x : Typed) -> Typed:
     new_dim_type = x.dim_type
     new_expr_type = UnaryOp(
@@ -267,7 +278,6 @@ def exp(x : Typed) -> Typed:
     )
     new_arr = np.exp(x.arr)
     return Typed(new_arr, *new_dim_type, expr_type=new_expr_type)
-
 
 def sin(x : Typed) -> Typed:
     new_dim_type = x.dim_type
@@ -278,7 +288,6 @@ def sin(x : Typed) -> Typed:
     new_arr = np.sin(x.arr)
     return Typed(new_arr, *new_dim_type, expr_type=new_expr_type)
 
-
 def cos(x : Typed) -> Typed:
     new_dim_type = x.dim_type
     new_expr_type = UnaryOp(
@@ -288,10 +297,17 @@ def cos(x : Typed) -> Typed:
     new_arr = np.cos(x.arr)
     return Typed(new_arr, *new_dim_type, expr_type=new_expr_type)
     
+def sqrt(x : Typed) -> Typed:
+    new_dim_type = x.dim_type
+    new_expr_type = UnaryOp(
+        op="sqrt",
+        child=x.expr_type,
+    )
+    new_arr = np.sqrt(x.arr)
+    return Typed(new_arr, *new_dim_type, expr_type=new_expr_type)
 
 def max(x : Typed, y : Typed) -> Typed:
     return _binary_op_helper(x, y, "max")
-
 
 @dataclass
 class LexState:
@@ -325,6 +341,7 @@ class LexState:
     def expect(self, s : str):
         self.consume_whitespace()
         if not self.spec.startswith(s):
+            breakpoint()
             raise ValueError(f"{s} expected")
         self.spec = self.spec[len(s):]
 
@@ -504,10 +521,29 @@ def _parse_factor(lex : LexState) -> tuple[DimType, ExprType]:
         assert isinstance(et, Reduce)
         et = dataclasses.replace(et, op=reduction)
         return dt, et
-    elif unary_op := lex.maybe_consume("exp", "sin", "cos"):
+    elif unary_op := lex.maybe_consume("exp", "sin", "cos", "sqrt", "softmax"):
+        if lex.maybe_consume('['):
+            if unary_op != "softmax":
+                raise ValueError("Dimension annotation only makes sense for softmax")
+
+            dim_annotation = _parse_dim(lex)
+            lex.expect(']')
+
         lex.expect('(')
-        dt, et = _parse_spec(lex)
+        dt, et = _parse_paren_expr(lex)
         lex.expect(')')
+        if unary_op == "softmax":
+            exp = UnaryOp(op="exp", child=et)
+            sum_exp = Repeat(
+                dim=dim_annotation,
+                child=Reduce(op="sum", dim=dim_annotation, child=exp),
+            )
+            return dt, BinaryOp(
+                op="/",
+                lhs=exp,
+                rhs=sum_exp,
+            )
+
         return dt, UnaryOp(
             op=unary_op,
             child=et,
@@ -553,7 +589,8 @@ def parse_spec_into_type(spec : str) -> tuple[DimType, ExprType]:
     Term      -> Factor Term'
     Term'     -> '*' Factor Term' | '/' Factor Term' | ε
 
-    Factor    -> REDUCE_OP '(' Contraction ')' | UNARY_FN '(' Spec ')' | Primary
+    Factor    -> REDUCE_OP '(' Contraction ')' | UNARY_FN DimAnnot? '(' ParenExpr ')' | Primary
+    DimAnnot  -> '[' DIM ']'
     Primary   -> '(' ParenExpr ')' | Tensor | Number
 
     ParenExpr -> Spec ParenExpr'
@@ -567,8 +604,8 @@ def parse_spec_into_type(spec : str) -> tuple[DimType, ExprType]:
 
     DIM       -> [A-Z][a-z0-9]*
     Number    -> [0-9]+ ('.' [0-9]+)?
-    UNARY_FN  -> 'exp' | 'sin' | 'cos'
-    REDUCE_OP -> 'sum' | 'max' | 'min' | 'prod'
+    UNARY_FN  -> 'exp' | 'sin' | 'cos' | 'sqrt' | 'softmax'
+    REDUCE_OP -> 'sum' | 'max'
     """
     lex = LexState(spec)
     return _parse_spec(lex)
@@ -615,8 +652,7 @@ def expr_types_are_equivalent(dim_type : tuple[Dim, ...], expected : ExprType, a
     expected_id = egraph.insert_expression(expected)
     actual_id = egraph.insert_expression(actual)
 
-    egraph.apply_rewrites()
-    return egraph.equivalent(expected_id, actual_id)
+    return egraph.incrementally_check_equivalence(expected_id, actual_id)
 
 class TypedResult:
     def __init__(self, spec : str):
