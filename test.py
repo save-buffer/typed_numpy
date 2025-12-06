@@ -123,6 +123,10 @@ def test_numerically_stable_softmax():
         softmax,
         "(exp(N) / (sum[N](exp(N)) -> N)) * ((exp(max[N](N)) -> N) / (exp(max[N](N)) -> N))",
     )
+    assert expr_simplifies(
+       softmax,
+       "(exp(N) / (sum[N](exp(N)) -> N)) * 1",
+    )
 
     naive.assign(softmax)
 
@@ -142,13 +146,34 @@ def test_online_softmax():
     l2 = exp2.sum(N)
 
     m_global = max(m1, m2)
-    l_global = l1 * exp(m1 - m_global) + l2 * exp(m2 - m_global)
+
+    l1_correction = exp(m1 - m_global)
+    l1_corrected = l1 * l1_correction
+
+    l2_correction = exp(m2 - m_global)
+    l2_corrected = l2 * l2_correction
+    l_global = l1_corrected + l2_corrected
+
+    assert expr_simplifies(m_global, "max[N](N)")
+    assert expr_simplifies(l1, "sum[N](exp(N[0:4] - (max[N](N[0:4]) -> N[0:4])))")
+    assert expr_simplifies(l2, "sum[N](exp(N[4:8] - (max[N](N[4:8]) -> N[4:8])))")
+    assert expr_simplifies(l1, "sum[N](exp(N[0:4])) / exp(max[N](N[0:4]))")
+    assert expr_simplifies(l1_correction, "exp(max[N](N[0:4])) / exp(max[N](N))")
+    assert expr_simplifies(l1_corrected, "(sum[N](exp(N[0:4])) / exp(max[N](N[0:4]))) * (exp(max[N](N[0:4])) / exp(max[N](N)))")
+    assert expr_simplifies(l1_corrected, "(sum[N](exp(N[0:4])) * exp(max[N](N[0:4]))) / (exp(max[N](N[0:4])) * exp(max[N](N)))")
+    assert expr_simplifies(l1_corrected, "(sum[N](exp(N[0:4])) * exp(max[N](N[0:4]))) / (exp(max[N](N)) * exp(max[N](N[0:4])))")
+    assert expr_simplifies(l1_corrected, "(sum[N](exp(N[0:4])) / exp(max[N](N))) * (exp(max[N](N[0:4])) / exp(max[N](N[0:4])))")
+    assert expr_simplifies(l1_corrected, "(sum[N](exp(N[0:4])) / exp(max[N](N))) * 1")
+
+    assert expr_simplifies(l1_corrected, "sum[N](exp(N[0:4])) / exp(max[N](N))")
+    
+    # assert expr_simplifies(l1_corrected, "sum[N](exp(N[0:4] - (max[N](N) -> N[0:4])))")
 
     softmax1 = exp(x_block1 - m_global.repeat(N[0:4])) / l_global.repeat(N[0:4])
     softmax2 = exp(x_block2 - m_global.repeat(N[4:8])) / l_global.repeat(N[4:8])
 
-    online.assign(softmax1)
-    online.assign(softmax2)
+    # online.assign(softmax1)
+    # online.assign(softmax2)
 
 
 def softmax_np(x):
@@ -204,10 +229,10 @@ def test_flash_attention():
 
 
 tests = [
-#    test_simple_expression,
-#    test_basic_matmul,
-#    test_exp,
-#    test_numerically_stable_softmax,
+    test_simple_expression,
+    test_basic_matmul,
+    test_exp,
+    test_numerically_stable_softmax,
     test_online_softmax,
 #    test_flash_attention,
 ]

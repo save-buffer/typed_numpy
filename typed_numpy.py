@@ -341,6 +341,7 @@ class LexState:
     def expect(self, s : str):
         self.consume_whitespace()
         if not self.spec.startswith(s):
+            breakpoint()
             raise ValueError(f"{s} expected")
         self.spec = self.spec[len(s):]
 
@@ -452,7 +453,16 @@ def _parse_number(lex : LexState) -> tuple[DimType, ExprType]:
     lex.spec = lex.spec[i:]
     return tuple(), Constant(constant)
 
-def _parse_dim(lex : LexState) -> FullDim:
+def _parse_integer(lex : LexState) -> int:
+    lex.consume_whitespace()
+    i = 0
+    while i < len(lex.spec) and lex.spec[i].isdigit():
+        i += 1
+    result = int(lex.spec[:i])
+    lex.spec = lex.spec[i:]
+    return result
+
+def _parse_dim_name(lex : LexState) -> FullDim:
     lex.consume_whitespace()
     i = 0
     while i < len(lex.spec) and lex.spec[i].isalpha():
@@ -464,12 +474,27 @@ def _parse_dim(lex : LexState) -> FullDim:
         raise ValueError(f"Parsed dim {dim_name} is not a known dimension!")
     return g_dim_registry[dim_name]
 
+def _parse_dim(lex : LexState) -> Dim:
+    dim = _parse_dim_name(lex)
+    if lex.maybe_consume('['):
+        slice_start = _parse_integer(lex)
+        lex.expect(':')
+        slice_end = _parse_integer(lex)
+        lex.expect(']')
+        dim = Sliced(
+            dim,
+            slice_start,
+            slice_end,
+        )
+    return dim
+
 def _parse_tensor(lex : LexState) -> tuple[DimType, ExprType]:
     dims = []
     while (nxt := lex.peek()) is not None and nxt.isalpha():
         d = _parse_dim(lex)
         dims.append(d)
-    return tuple(dims), Tensor(tuple(dims))
+    full_dims = tuple(dim_full_dim(d) for d in dims)
+    return tuple(dims), Tensor(full_dims)
 
 def _parse_contraction(lex : LexState, reduction : ReduceOpType = "sum") -> tuple[DimType, ExprType]:
     lhs_dt, lhs_et = _parse_spec(lex)
@@ -535,9 +560,10 @@ def _parse_factor(lex : LexState) -> tuple[DimType, ExprType]:
             dt, et = _parse_paren_expr(lex)
             lex.expect(')')
             reduce_dt = tuple(d for d in dt if dim_full_dim(d) != dim_full_dim(dim))
+            reduce_dim = [d for d in dt if dim_full_dim(d) == dim_full_dim(dim)][0]
             reduce_et = Reduce(
                 reduction,
-                dim,
+                reduce_dim,
                 et,
             )
             return reduce_dt, reduce_et
@@ -631,7 +657,8 @@ def parse_spec_into_type(spec : str) -> tuple[DimType, ExprType]:
     Tensor    -> DIM Tensor'
     Tensor'   -> DIM Tensor' | ε
 
-    DIM       -> [A-Z][a-z0-9]*
+    DIM       -> DimName | DimName '[' Integer ']'
+    DimName   -> [A-Z][a-z0-9]*
     Number    -> [0-9]+ ('.' [0-9]+)?
     UNARY_FN  -> 'exp' | 'sin' | 'cos' | 'sqrt' | 'softmax'
     REDUCE_OP -> 'sum' | 'max'
@@ -674,20 +701,20 @@ def map_expr_to_dim_type(dim_type : tuple[Dim, ...], expr : ExprType) -> ExprTyp
     dims_by_name = { dim_name(d) : d for d in dim_type }
     return remap_dims_by_name(dims_by_name, expr)
 
-def expr_types_are_equivalent(dim_type : tuple[Dim, ...], expected : ExprType, actual : ExprType) -> bool:
+def expr_types_are_equivalent(dim_type : tuple[Dim, ...], expected : ExprType, actual : ExprType, niters : int = 10) -> bool:
     expected = map_expr_to_dim_type(dim_type, expected)
 
     egraph = Egraph()
     expected_id = egraph.insert_expression(expected)
     actual_id = egraph.insert_expression(actual)
-    return egraph.incrementally_check_equivalence(expected_id, actual_id)
+    return egraph.incrementally_check_equivalence(expected_id, actual_id, niters)
 
-def expr_simplifies(expr : Typed, spec : str, niters : int = 10) -> bool:
+def expr_simplifies(expr : Typed, spec : str, niters : int = 15) -> bool:
     spec_dt, spec_et = parse_spec_into_type(spec)
     egraph = Egraph()
     expected_id = egraph.insert_expression(expr.expr_type)
     actual_id = egraph.insert_expression(spec_et)
-    return egraph.incrementally_check_equivalence(expected_id, actual_id, max_iters=niters)
+    return egraph.incrementally_check_equivalence(expected_id, actual_id, niters)
 
 class TypedResult:
     def __init__(self, spec : str):
