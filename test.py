@@ -187,6 +187,28 @@ def test_online_softmax():
         niters=8,
     )
     assert rewrite_found(
+        l2_corrected,
+        "sum[N](exp(N[4:8])) / exp(max[N](N))",
+        niters=8,
+    )
+    assert rewrite_found(
+        l_global,
+        "(sum[N](exp(N[0:4])) / exp(max[N](N))) + (sum[N](exp(N[4:8])) / exp(max[N](N)))",
+        niters=8,
+    )
+    assert rewrite_found(
+        l_global,
+        "(sum[N](exp(N[0:4])) + sum[N](exp(N[4:8]))) / exp(max[N](N))",
+        niters=9,
+    )
+    assert rewrite_found(
+        l_global,
+        "sum[N](exp(N)) / exp(max[N](N))",
+        niters=9,
+    )
+    breakpoint()
+
+    assert rewrite_found(
         l1_corrected,
         "sum[N](exp(N[0:4]) / (exp(max[N](N)) -> N[0:4]))",
         niters=8,
@@ -199,6 +221,12 @@ def test_online_softmax():
     assert rewrite_found(
         l1_corrected,
         "sum[N](exp(N[0:4] - (max[N](N) -> N[0:4])))",
+        niters=10,
+    )
+
+    assert rewrite_found(
+        l_global,
+        "sum[N](exp(N[0:4] - (max[N](N) -> N[0:4]))) + sum[N](exp(N[4:8] - (max[N](N) -> N[4:8])))",
         niters=10,
     )
 

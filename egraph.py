@@ -117,6 +117,7 @@ class Egraph:
             self._distributivity,
             self._inverse_distributivity,
             self._div_distributivity,
+            self._add_or_subtract_fractions,
             self._multiply_fractions,
             self._decompose_fractions,
             self._identity,
@@ -595,6 +596,36 @@ class Egraph:
                 op=EnodeType.Mul,
                 args=(lhs, reciprocal),
             )
+
+    def _add_or_subtract_fractions(self, id : EclassID, enode : Enode):
+        # (a / d) + (b / d) = (a + b) / d
+        if enode.op not in (EnodeType.Add, EnodeType.Sub):
+            return
+
+        lhs, rhs = enode.args
+        lhs_enodes = self.get_enodes(lhs)
+        rhs_enodes = self.get_enodes(rhs)
+        for lhs_enode in lhs_enodes:
+            if lhs_enode.op != EnodeType.Div:
+                continue
+
+            a, lhs_d = lhs_enode.args
+            for rhs_enode in rhs_enodes:
+                if rhs_enode.op != EnodeType.Div:
+                    continue
+                b, rhs_d = rhs_enode.args
+                if not self.equivalent(lhs_d, rhs_d):
+                    continue
+
+                ab = Enode(
+                    op=enode.op,
+                    args=(a, b),
+                )
+                self.add_match(
+                    id,
+                    op=EnodeType.Div,
+                    args=(ab, lhs_d),
+                )
     
     def _multiply_fractions(self, id : EclassID, enode : Enode):
         # (a / c) * (b / d) = (a * b) / (c * d)
