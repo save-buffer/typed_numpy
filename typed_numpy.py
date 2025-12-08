@@ -562,14 +562,14 @@ def _parse_factor(lex : LexState) -> tuple[DimType, ExprType]:
             reduce_dt = tuple(d for d in dt if dim_full_dim(d) != dim_full_dim(dim))
             reduce_dim = [d for d in dt if dim_full_dim(d) == dim_full_dim(dim)][0]
             reduce_et = Reduce(
-                reduction,
+                reduction, # ty: ignore
                 reduce_dim,
                 et,
             )
             return reduce_dt, reduce_et
         else:
             lex.expect('(')
-            dt, et = _parse_contraction(lex, reduction=reduction)
+            dt, et = _parse_contraction(lex, reduction=reduction) # ty: ignore
             lex.expect(')')
             return dt, et
     elif unary_op := lex.maybe_consume("exp", "sin", "cos", "sqrt", "softmax"):
@@ -600,7 +600,7 @@ def _parse_factor(lex : LexState) -> tuple[DimType, ExprType]:
             )
 
         return dt, UnaryOp(
-            op=unary_op,
+            op=unary_op, # ty: ignore
             child=et,
         )
     else:
@@ -612,7 +612,7 @@ def _parse_term(lex : LexState) -> tuple[DimType, ExprType]:
         rhs_dt, rhs_et = _parse_factor(lex)
         result_dt = _normalize_dts_for_binary_op(result_dt, rhs_dt)
         result_et = BinaryOp(
-            op=op,
+            op=op, # ty: ignore
             lhs=result_et,
             rhs=rhs_et,
         )
@@ -624,7 +624,7 @@ def _parse_expr(lex : LexState) -> tuple[DimType, ExprType]:
         rhs_dt, rhs_et = _parse_term(lex)
         result_dt = _normalize_dts_for_binary_op(result_dt, rhs_dt)
         result_et = BinaryOp(
-            op=op,
+            op=op, # ty: ignore
             lhs=result_et,
             rhs=rhs_et,
         )
@@ -709,12 +709,25 @@ def expr_types_are_equivalent(dim_type : tuple[Dim, ...], expected : ExprType, a
     actual_id = egraph.insert_expression(actual)
     return egraph.incrementally_check_equivalence(expected_id, actual_id, niters)
 
-def expr_simplifies(expr : Typed, spec : str, niters : int = 15) -> bool:
+def expr_simplifies(expr : Typed, spec : str, niters : int = 15, dump_to_dot : bool = False) -> bool:
     spec_dt, spec_et = parse_spec_into_type(spec)
     egraph = Egraph()
     expected_id = egraph.insert_expression(expr.expr_type)
     actual_id = egraph.insert_expression(spec_et)
-    return egraph.incrementally_check_equivalence(expected_id, actual_id, niters)
+    result = egraph.incrementally_check_equivalence(expected_id, actual_id, niters)
+    if dump_to_dot:
+        egraph.dump_to_dot()
+    return result
+
+def rewrite_found(expr : Typed, rewrite : str, niters : int = 5):
+    rw_dt, rw_et = parse_spec_into_type(rewrite)
+    egraph = Egraph()
+    expr_id = egraph.insert_expression(expr.expr_type)
+    egraph.perform_equality_saturation(niters)
+
+    rw_id = egraph.insert_expression(rw_et)
+    result = egraph.equivalent(expr_id, rw_id)
+    return result
 
 class TypedResult:
     def __init__(self, spec : str):

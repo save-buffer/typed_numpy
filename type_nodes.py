@@ -103,7 +103,7 @@ class Constant:
 class Tensor:
     dims : tuple[FullDim, ...]
 
-UnaryOpType = Literal["exp", "sin", "cos"]
+UnaryOpType = Literal["exp", "sin", "cos", "sqrt"]
 
 @dataclass(frozen=True)
 class UnaryOp:

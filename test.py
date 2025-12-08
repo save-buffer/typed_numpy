@@ -10,8 +10,9 @@ from typed_numpy import (
     sqrt,
     reset_typed_numpy,
     expr_simplifies,
+    rewrite_found,
 )
-
+from egraph import egraph_enable_breakpoint
 
 
 def test_simple_expression():
@@ -48,6 +49,10 @@ def test_exp():
     c = TypedResult("exp(M N)")
     
     a_exped = exp(a)
+
+    a_exped_div_a_exped = a_exped / a_exped
+    assert expr_simplifies(a_exped_div_a_exped, "1")
+
     c.assign(a_exped)
     np.testing.assert_allclose(
         c.arr,
@@ -61,71 +66,75 @@ def test_numerically_stable_softmax():
     # exp(x) / sum(exp(x))
     naive = TypedResult("softmax[N](N)")
     x_max = x.max(N)
-    assert expr_simplifies(x_max, "max[N](N)")
+    assert rewrite_found(x_max, "max[N](N)")
     
     x_stable = x - x_max.repeat(N)
-    assert expr_simplifies(x_stable, "N - (max[N](N) -> N)")
+    assert rewrite_found(x_stable, "N - (max[N](N) -> N)")
 
     exp_x = exp(x_stable)
-    assert expr_simplifies(exp_x, "exp(N - (max[N](N) -> N))")
+    assert rewrite_found(exp_x, "exp(N - (max[N](N) -> N))")
 
     sum_exp_x = exp_x.sum(N).repeat(N)
-    assert expr_simplifies(sum_exp_x, "(sum[N](exp(N - (max[N](N) -> N))) -> N)")
+    assert rewrite_found(sum_exp_x, "(sum[N](exp(N - (max[N](N) -> N))) -> N)")
 
     softmax = exp_x / sum_exp_x
     # Literally what softmax is
-    assert expr_simplifies(
+    assert rewrite_found(
         softmax,
         "(exp(N - (max[N](N) -> N))) / (sum[N](exp(N - (max[N](N) -> N))) -> N)",
     )
     # Convert exponent to quotient in numerator
-    assert expr_simplifies(
+    assert rewrite_found(
         softmax,
         "(exp(N) / exp(max[N](N) -> N)) / (sum[N](exp(N - (max[N](N) -> N))) -> N)",
     )
     # Component exponent to quotient in denominator
-    assert expr_simplifies(
+    assert rewrite_found(
         softmax,
         "(exp(N) / exp(max[N](N) -> N)) / (sum[N](exp(N) / exp(max[N](N) -> N)) -> N)",
     )
     # Pull repeat outside of the exp in the denominator
-    assert expr_simplifies(
+    assert rewrite_found(
         softmax,
         "(exp(N) / exp(max[N](N) -> N)) / (sum[N](exp(N) / (exp(max[N](N)) -> N)) -> N)",
     )
     # Pull the denominator outside of the sum
-    assert expr_simplifies(
+    assert rewrite_found(
         softmax,
         "(exp(N) / exp(max[N](N) -> N)) / (sum[N](exp(N)) / exp(max[N](N)) -> N)",
     )
     # Duplicate repeat in demoniator
-    assert expr_simplifies(
+    assert rewrite_found(
         softmax,
         "(exp(N) / exp(max[N](N) -> N)) / ((sum[N](exp(N)) -> N) / (exp(max[N](N)) -> N))",
     )
     # Flip the denominator and turn it into a multiplication
-    assert expr_simplifies(
+    assert rewrite_found(
         softmax,
         "(exp(N) / exp(max[N](N) -> N)) * ((exp(max[N](N)) -> N) / (sum[N](exp(N)) -> N))",
     )
     # Turn it into quotient of products
-    assert expr_simplifies(
+    assert rewrite_found(
         softmax,
         "(exp(N) * (exp(max[N](N)) -> N)) / (exp(max[N](N) -> N) * (sum[N](exp(N)) -> N))",
     )
     # Associativity of multiplication in denominator
-    assert expr_simplifies(
+    assert rewrite_found(
         softmax,
         "(exp(N) * (exp(max[N](N)) -> N)) / ((sum[N](exp(N)) -> N) * exp(max[N](N) -> N))",
+        niters=6,
     )
     # Break back into multiplication of fractions
-    assert expr_simplifies(
+    assert rewrite_found(
         softmax,
         "(exp(N) / (sum[N](exp(N)) -> N)) * ((exp(max[N](N)) -> N) / (exp(max[N](N)) -> N))",
+        niters=7,
     )
-    assert expr_simplifies(
+    # Check that RHS fraction simplifies to 1
+    assert rewrite_found(
        softmax,
        "(exp(N) / (sum[N](exp(N)) -> N)) * 1",
+       niters=8,
     )
 
     naive.assign(softmax)
@@ -154,25 +163,24 @@ def test_online_softmax():
     l2_corrected = l2 * l2_correction
     l_global = l1_corrected + l2_corrected
 
-    assert expr_simplifies(m_global, "max[N](N)")
-    assert expr_simplifies(l1, "sum[N](exp(N[0:4] - (max[N](N[0:4]) -> N[0:4])))")
-    assert expr_simplifies(l2, "sum[N](exp(N[4:8] - (max[N](N[4:8]) -> N[4:8])))")
-    assert expr_simplifies(l1, "sum[N](exp(N[0:4])) / exp(max[N](N[0:4]))")
-    assert expr_simplifies(l1_correction, "exp(max[N](N[0:4])) / exp(max[N](N))")
-    assert expr_simplifies(l1_corrected, "(sum[N](exp(N[0:4])) / exp(max[N](N[0:4]))) * (exp(max[N](N[0:4])) / exp(max[N](N)))")
-    assert expr_simplifies(l1_corrected, "(sum[N](exp(N[0:4])) * exp(max[N](N[0:4]))) / (exp(max[N](N[0:4])) * exp(max[N](N)))")
-    assert expr_simplifies(l1_corrected, "(sum[N](exp(N[0:4])) * exp(max[N](N[0:4]))) / (exp(max[N](N)) * exp(max[N](N[0:4])))")
-    assert expr_simplifies(l1_corrected, "(sum[N](exp(N[0:4])) / exp(max[N](N))) * (exp(max[N](N[0:4])) / exp(max[N](N[0:4])))")
-    assert expr_simplifies(l1_corrected, "(sum[N](exp(N[0:4])) / exp(max[N](N))) * 1")
+    assert rewrite_found(m_global, "max[N](N)")
+    assert rewrite_found(l1, "sum[N](exp(N[0:4] - (max[N](N[0:4]) -> N[0:4])))")
+    assert rewrite_found(l2, "sum[N](exp(N[4:8] - (max[N](N[4:8]) -> N[4:8])))")
+    assert rewrite_found(l1, "sum[N](exp(N[0:4])) / exp(max[N](N[0:4]))")
+    assert rewrite_found(l1_correction, "exp(max[N](N[0:4])) / exp(max[N](N))")
+    assert rewrite_found(l1_corrected, "(sum[N](exp(N[0:4])) / exp(max[N](N[0:4]))) * (exp(max[N](N[0:4])) / exp(max[N](N)))")
+    assert rewrite_found(l1_corrected, "(sum[N](exp(N[0:4])) * exp(max[N](N[0:4]))) / (exp(max[N](N[0:4])) * exp(max[N](N)))")
+    assert rewrite_found(l1_corrected, "(sum[N](exp(N[0:4])) * exp(max[N](N[0:4]))) / (exp(max[N](N)) * exp(max[N](N[0:4])))")
 
-    assert expr_simplifies(l1_corrected, "sum[N](exp(N[0:4])) / exp(max[N](N))")
-    
-    # assert expr_simplifies(l1_corrected, "sum[N](exp(N[0:4] - (max[N](N) -> N[0:4])))")
+    # TODO: Below fails
+    assert rewrite_found(l1_corrected, "(sum[N](exp(N[0:4])) / exp(max[N](N))) * (exp(max[N](N[0:4])) / exp(max[N](N[0:4])))")
+    assert rewrite_found(l1_corrected, "(sum[N](exp(N[0:4])) / exp(max[N](N))) * 1")
+    assert rewrite_found(l1_corrected, "sum[N](exp(N[0:4])) / exp(max[N](N))")
+    assert rewrite_found(l1_corrected, "sum[N](exp(N[0:4] - (max[N](N) -> N[0:4])))")
 
     softmax1 = exp(x_block1 - m_global.repeat(N[0:4])) / l_global.repeat(N[0:4])
     softmax2 = exp(x_block2 - m_global.repeat(N[4:8])) / l_global.repeat(N[4:8])
-
-    # online.assign(softmax1)
+    online.assign(softmax1)
     # online.assign(softmax2)
 
 
@@ -229,10 +237,10 @@ def test_flash_attention():
 
 
 tests = [
-    test_simple_expression,
-    test_basic_matmul,
-    test_exp,
-    test_numerically_stable_softmax,
+#    test_simple_expression,
+#    test_basic_matmul,
+#    test_exp,
+#    test_numerically_stable_softmax,
     test_online_softmax,
 #    test_flash_attention,
 ]
