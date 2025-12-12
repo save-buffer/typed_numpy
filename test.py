@@ -281,7 +281,7 @@ tests = [
     test_exp,
     test_numerically_stable_softmax,
     test_online_softmax,
-#    test_flash_attention,
+    test_flash_attention,
 ]
 
 if __name__ == '__main__':
