@@ -204,36 +204,23 @@ def test_online_softmax():
     assert rewrite_found(
         l_global,
         "sum[N](exp(N)) / exp(max[N](N))",
-        niters=9,
-    )
-    breakpoint()
-
-    assert rewrite_found(
-        l1_corrected,
-        "sum[N](exp(N[0:4]) / (exp(max[N](N)) -> N[0:4]))",
-        niters=8,
-    )
-    assert rewrite_found(
-        l1_corrected,
-        "sum[N](exp(N[0:4]) / (exp(max[N](N) -> N[0:4])))",
-        niters=8,
-    )
-    assert rewrite_found(
-        l1_corrected,
-        "sum[N](exp(N[0:4] - (max[N](N) -> N[0:4])))",
         niters=10,
     )
-
     assert rewrite_found(
         l_global,
-        "sum[N](exp(N[0:4] - (max[N](N) -> N[0:4]))) + sum[N](exp(N[4:8] - (max[N](N) -> N[4:8])))",
+        "sum[N](exp(N) / (exp(max[N](N)) -> N))",
+        niters=10,
+    )
+    assert rewrite_found(
+        l_global,
+        "sum[N](exp(N - (max[N](N) -> N)))",
         niters=10,
     )
 
     softmax1 = exp(x_block1 - m_global.repeat(N[0:4])) / l_global.repeat(N[0:4])
     softmax2 = exp(x_block2 - m_global.repeat(N[4:8])) / l_global.repeat(N[4:8])
     online.assign(softmax1)
-    # online.assign(softmax2)
+    online.assign(softmax2)
 
 
 def softmax_np(x):
@@ -289,10 +276,10 @@ def test_flash_attention():
 
 
 tests = [
-#    test_simple_expression,
-#    test_basic_matmul,
-#    test_exp,
-#    test_numerically_stable_softmax,
+    test_simple_expression,
+    test_basic_matmul,
+    test_exp,
+    test_numerically_stable_softmax,
     test_online_softmax,
 #    test_flash_attention,
 ]

@@ -61,7 +61,7 @@ class Typed:
 
         nrepeats = dim_size(dim)
         repeated_arr = self.arr[None].repeat(nrepeats, axis=0)
-        new_expr_type = Repeat(dim, self.expr_type)
+        new_expr_type = Repeat(dim_full_dim(dim), self.expr_type)
         return Typed(repeated_arr, *new_dim_type, expr_type=new_expr_type)
 
     def rearrange(self, *dims : Dim) -> "Typed":
@@ -389,11 +389,11 @@ def _construct_binary_reduction_expr(
     a_repeated, b_repeated = expr_a, expr_b
     for name, d in b_dims_by_name.items():
         if name not in common_dims:
-            a_repeated = Repeat(d, a_repeated)
+            a_repeated = Repeat(dim_full_dim(d), a_repeated)
 
     for name, d in a_dims_by_name.items():
         if name not in common_dims:
-            b_repeated = Repeat(d, b_repeated)
+            b_repeated = Repeat(dim_full_dim(d), b_repeated)
     a, b = a_repeated, b_repeated
     
     reduction_dims = [a_dims_by_name[name] for name in common_dims if name not in rhs_dim_names]
@@ -428,7 +428,7 @@ def _construct_unary_reduction_expr(
 
     result = expr_a
     for d in repeat_dims:
-        result = Repeat(d, result)
+        result = Repeat(dim_full_dim(d), result)
     for d in reduction_dims:
         result = Reduce(reduction, d, result)
     return result
@@ -586,7 +586,7 @@ def _parse_factor(lex : LexState) -> tuple[DimType, ExprType]:
         if unary_op == "softmax":
             exp = UnaryOp(op="exp", child=et)
             sum_exp = Repeat(
-                dim=dim_annotation,
+                dim=dim_full_dim(dim_annotation),
                 child=Reduce(
                     op="sum",
                     dim=dim_annotation,
@@ -702,7 +702,7 @@ def map_expr_to_dim_type(dim_type : tuple[Dim, ...], expr : ExprType) -> ExprTyp
     return remap_dims_by_name(dims_by_name, expr)
 
 def expr_types_are_equivalent(dim_type : tuple[Dim, ...], expected : ExprType, actual : ExprType, niters : int = 10) -> bool:
-    expected = map_expr_to_dim_type(dim_type, expected)
+    # expected = map_expr_to_dim_type(dim_type, expected)
 
     egraph = Egraph()
     expected_id = egraph.insert_expression(expected)

@@ -115,7 +115,7 @@ class Egraph:
             self._commutativity,
             self._associativity,
             self._distributivity,
-            self._inverse_distributivity,
+            # self._inverse_distributivity, # This one seems to take an excessive amount of time
             self._div_distributivity,
             self._add_or_subtract_fractions,
             self._multiply_fractions,
@@ -138,6 +138,7 @@ class Egraph:
             self._decompose_exp,
             self._recompose_exp,
             self._log_sum_exp_stability,
+            self._numerically_stable_softmax,
         ]
 
     @property
@@ -406,6 +407,8 @@ class Egraph:
                     and dim_full_dim(lhs_dim) == dim_full_dim(rhs_dim)
                     and dim_end(lhs_dim) == dim_start(rhs_dim)
                 ):
+                    if enode.op == EnodeType.Add:
+                        maybe_breakpoint()
                     combined_dim = simplify_dim(
                         Sliced(
                             dim_full_dim(lhs_dim),
@@ -458,7 +461,7 @@ class Egraph:
                     continue
 
                 repeat_dim, repeat_rhs = rhs_enode.args
-                if repeat_dim != sum_dim:
+                if repeat_dim != dim_full_dim(sum_dim):
                     continue
 
                 sum_x = Enode(
@@ -486,7 +489,7 @@ class Egraph:
             dim, x = lhs_enode.args
             y_repeated = Enode(
                 op=EnodeType.Repeat,
-                args=(dim, rhs),
+                args=(dim_full_dim(dim), rhs),
             )
             x_div_y = Enode(
                 op=EnodeType.Div,
@@ -890,7 +893,7 @@ class Egraph:
                 # max(x).repeat()
                 m_repeated = Enode(
                     op=EnodeType.Repeat,
-                    args=(dim, m),
+                    args=(dim_full_dim(dim), m),
                 )
                 # x - max(x).repeat()
                 x_minus_m = Enode(
@@ -918,6 +921,64 @@ class Egraph:
                     op=EnodeType.Mul,
                     args=(exp_m, sum_exp),
                 )
+
+    def _numerically_stable_softmax(self, id : EclassID, enode : Enode):
+        # exp(x) / sum(exp(x)).repeat() = exp(x - max(x).repeat()) / sum(exp(x - max(x).repeat()))
+        if enode.op != EnodeType.Div:
+            return
+
+        lhs, rhs = enode.args
+        lhs_enodes = self.get_enodes(lhs)
+        rhs_enodes = self.get_enodes(rhs)
+        for lhs_enode in lhs_enodes:
+            if lhs_enode.op != EnodeType.Exp:
+                continue
+            for rhs_enode in rhs_enodes:
+                if rhs_enode.op != EnodeType.Repeat:
+                    continue
+                repeat_dim, maybe_sum = rhs_enode.args
+                maybe_sum_enodes = self.get_enodes(maybe_sum)
+                for maybe_sum_enode in maybe_sum_enodes:
+                    if maybe_sum_enode.op != EnodeType.Sum:
+                        continue
+
+                    sum_dim, maybe_lhs = maybe_sum_enode.args
+                    if not self.equivalent(lhs, maybe_lhs):
+                        continue
+                    if dim_full_dim(sum_dim) != repeat_dim:
+                        continue
+
+                    x, = lhs_enode.args
+                    max_x = Enode(
+                        op=EnodeType.Max,
+                        args=(sum_dim, x),
+                    )
+                    max_x_repeated = Enode(
+                        op=EnodeType.Repeat,
+                        args=(repeat_dim, max_x),
+                    )
+                    x_corrected = Enode(
+                        op=EnodeType.Sub,
+                        args=(x, max_x_repeated),
+                    )
+                    exp_x_corrected = Enode(
+                        op=EnodeType.Exp,
+                        args=(x_corrected,),
+                    )
+                    sum_exp_x_corrected = Enode(
+                        op=EnodeType.Sum,
+                        args=(sum_dim, exp_x_corrected),
+                    )
+                    sum_exp_x_corrected_repeated = Enode(
+                        op=EnodeType.Repeat,
+                        args=(repeat_dim, sum_exp_x_corrected),
+                    )
+                    self.add_match(
+                        id,
+                        op=EnodeType.Div,
+                        args=(exp_x_corrected, sum_exp_x_corrected_repeated),
+                    )
+        
 
     def _canonicalize(self, enode : Enode) -> Enode:
         canonicalized_args = tuple(
@@ -1014,9 +1075,10 @@ class Egraph:
                 )
                 return self.add(enode)
             case Tensor(dims):
+                canon_dims = tuple(dim_full_dim(d) for d in dims)
                 enode = Enode(
                     op=EnodeType.Tensor,
-                    args=(dims,),
+                    args=canon_dims,
                 )
                 return self.add(enode)
             case UnaryOp(op, child):
@@ -1038,7 +1100,7 @@ class Egraph:
                 child_id = self.insert_expression(child)
                 enode = Enode(
                     op=EnodeType.Repeat,
-                    args=(dim, child_id),
+                    args=(dim_full_dim(dim), child_id),
                 )
                 return self.add(enode)
             case Reduce(op, dim, child):
