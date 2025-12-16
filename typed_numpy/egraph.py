@@ -6,6 +6,9 @@ from enum import Enum
 from typing import Any, Callable
 
 from .type_nodes import *
+from .typed_numpy import RustEgraph
+
+egg = RustEgraph()
 
 enable_breakpoint = False
 
