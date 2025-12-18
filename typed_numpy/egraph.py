@@ -46,7 +46,7 @@ def expr_type_to_rust_expr(expr : ExprType) -> RustExpr:
             rust_child = expr_type_to_rust_expr(child)
             return RustExpr.Repeat(d, rust_child)
         case Reduce(op, dim, child):
-            d = dim_name(d)
+            d = dim_name(dim)
             start, end = dim_start(dim), dim_end(dim)
             rust_child = expr_type_to_rust_expr(child)
             match op:
@@ -64,7 +64,6 @@ def check_if_exprs_equal_rust(x : ExprType, y : ExprType) -> bool:
     x_id = egg.insert_expression(x_rust)
     y_id = egg.insert_expression(y_rust)
     return egg.incrementally_check_equivalence(x_id, y_id)
-    
 
 enable_breakpoint = False
 

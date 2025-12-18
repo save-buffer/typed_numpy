@@ -197,7 +197,9 @@ mod typed_numpy
         }
 
         add_rule!((Add a b) => (Add b a)); // commutativity
+        add_rule!((Mul a b) => (Mul b a)); // commutativity
         add_rule!((Add (Add a b) c) <=> (Add a (Add b c))); // associativity
+        add_rule!((Mul (Mul a b) c) <=> (Mul a (Mul b c))); // associativity
         add_rule!((Mul a (Add b c)) <=> (Add (Mul a b) (Mul a c))); // distributivity
         add_rule!((Div (Add a b) c) <=> (Add (Div a c) (Div b c))); // div_distributivity
         // repeat_over_unary_ops
@@ -301,34 +303,61 @@ mod typed_numpy
             return Ok(expr_id);
         }
 
+        #[pyo3(signature = (a_id, b_id, verbose=false))]
         fn incrementally_check_equivalence(
             &mut self,
             a_id : &str,
             b_id : &str,
+            verbose : bool,
         ) -> PyResult<bool>
         {
-            for _ in 0..10
+            for i in 0..10
             {
-                println!("Running ruleset");
-                run_ruleset(&mut self.eg, Ruleset).map_err(TypedNumpyError::from)?;
+                if verbose
+                {
+                    println!("Running ruleset iteration {}", i);
+                }
+                let run_result = run_ruleset(
+                    &mut self.eg,
+                    Ruleset,
+                ).map_err(TypedNumpyError::from)?;
+                if verbose
+                {
+                    println!("Ruleset run result: {:#?}", run_result);
+                }
+
+                // Construct the equality fact directly
+                let equality_fact = Fact::Eq(
+                    span!(),
+                    exprs::var(a_id),
+                    exprs::var(b_id)
+                );
+
                 let check_result = self.eg.run_program(
                     vec![
+                        Command::PrintOverallStatistics,
                         Command::Check(
                             span!(),
-                            vec![
-                                Fact::Eq(
-                                    span!(),
-                                    exprs::var(a_id),
-                                    exprs::var(b_id),
-                                ),
-                            ],
+                            vec![equality_fact],
                         )
                     ],
                 );
+                if verbose
+                {
+                    println!("Check result: {:#?}", check_result);
+                }
                 if check_result.is_ok()
                 {
+                    if verbose
+                    {
+                        println!("Found equivalence at iteration {}", i);
+                    }
                     return Ok(true);
                 }
+            }
+            if verbose
+            {
+                println!("No equivalence found after 10 iterations");
             }
             return Ok(false);
         }

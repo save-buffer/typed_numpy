@@ -739,8 +739,19 @@ def expr_types_are_equivalent(
     actual_id = g_egraph.insert_expression(actual)
     return g_egraph.incrementally_check_equivalence(expected_id, actual_id, niters)
 
-def expr_simplifies(expr : Typed, spec : str, niters : int = 15, dump_to_dot : bool = False) -> bool:
+def expr_simplifies(
+    expr : Typed,
+    spec : str,
+    niters : int = 15,
+    dump_to_dot : bool = False,
+    use_rust : bool = False,
+) -> bool:
     spec_dt, spec_et = parse_spec_into_type(spec)
+    if use_rust:
+        if dump_to_dot:
+            raise NotImplementedError("Dumping to Dot not supported for Rust-based egraph")
+        return check_if_exprs_equal_rust(expr.expr_type, spec_et)
+
     egraph = Egraph()
     expected_id = egraph.insert_expression(expr.expr_type)
     actual_id = egraph.insert_expression(spec_et)
@@ -749,8 +760,16 @@ def expr_simplifies(expr : Typed, spec : str, niters : int = 15, dump_to_dot : b
         egraph.dump_to_dot()
     return result
 
-def rewrite_found(expr : Typed, rewrite : str, niters : int = 5):
+def rewrite_found(
+    expr : Typed,
+    rewrite : str,
+    niters : int = 5,
+    use_rust : bool = True,
+):
     rw_dt, rw_et = parse_spec_into_type(rewrite)
+    if use_rust:
+        return check_if_exprs_equal_rust(expr.expr_type, rw_et)
+
     egraph = Egraph()
     expr_id = egraph.insert_expression(expr.expr_type)
     egraph.perform_equality_saturation(niters)
@@ -765,7 +784,7 @@ class TypedResult:
         self.shape = tuple(dim_size(d) for d in self.expected_dim_type) if self.expected_dim_type is not None else tuple()
         self.arr = np.zeros(self.shape)
         
-    def assign(self, result : Typed, use_rust : bool = False):
+    def assign(self, result : Typed, use_rust : bool = True):
         if not expr_types_are_equivalent(
                 dim_type=result.dim_type,
                 expected=self.expected_expr_type,
