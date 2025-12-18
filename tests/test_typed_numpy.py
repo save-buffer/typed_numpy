@@ -27,7 +27,7 @@ def test_simple_expression(reset):
     for i in range(0, 10, 5):
         a_tile = a.slice(M, i, i + 5)
         a_scaled = a_tile * 2
-        b.assign(a_scaled)
+        b.assign(a_scaled, use_rust=True)
 
 
 def test_basic_matmul(reset):

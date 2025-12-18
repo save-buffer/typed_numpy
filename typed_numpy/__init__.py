@@ -6,7 +6,7 @@ import numpy as np
 import einops
 
 from .type_nodes import *
-from .egraph import Egraph, EclassID
+from .egraph import Egraph, EclassID, check_if_exprs_equal_rust
 
 class Typed:
     def __init__(self, arr : np.ndarray, *dim_type : Dim, expr_type : ExprType | None = None):
@@ -724,7 +724,16 @@ def map_expr_to_dim_type(dim_type : tuple[Dim, ...], expr : ExprType) -> ExprTyp
 
 g_egraph = Egraph()
 
-def expr_types_are_equivalent(dim_type : tuple[Dim, ...], expected : ExprType, actual : ExprType, niters : int = 10) -> bool:
+def expr_types_are_equivalent(
+    dim_type : tuple[Dim, ...],
+    expected : ExprType,
+    actual : ExprType,
+    niters : int = 10,
+    use_rust : bool = False,
+) -> bool:
+    if use_rust:
+        return check_if_exprs_equal_rust(expected, actual)
+
     global g_egraph
     expected_id = g_egraph.insert_expression(expected)
     actual_id = g_egraph.insert_expression(actual)
@@ -756,11 +765,12 @@ class TypedResult:
         self.shape = tuple(dim_size(d) for d in self.expected_dim_type) if self.expected_dim_type is not None else tuple()
         self.arr = np.zeros(self.shape)
         
-    def assign(self, result : Typed):
+    def assign(self, result : Typed, use_rust : bool = False):
         if not expr_types_are_equivalent(
                 dim_type=result.dim_type,
                 expected=self.expected_expr_type,
-                actual=result.expr_type
+                actual=result.expr_type,
+                use_rust=use_rust,
         ):
             raise ValueError(f"Attempted to assign a tensor that does not match the spec! Expected: {self.expected_expr_type}, actual: {result.expr_type}")
 

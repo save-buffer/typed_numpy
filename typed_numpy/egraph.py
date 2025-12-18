@@ -8,7 +8,7 @@ from typing import Any, Callable
 from .type_nodes import *
 from .typed_numpy import RustEgraph, RustExpr
 
-def expr_type_to_rust_expr(self, expr : ExprType) -> RustExpr:
+def expr_type_to_rust_expr(expr : ExprType) -> RustExpr:
     match expr:
         case Constant(v):
             return RustExpr.Constant(v)
@@ -63,6 +63,7 @@ def check_if_exprs_equal_rust(x : ExprType, y : ExprType) -> bool:
     y_rust = expr_type_to_rust_expr(y)
     x_id = egg.insert_expression(x_rust)
     y_id = egg.insert_expression(y_rust)
+    return egg.incrementally_check_equivalence(x_id, y_id)
     
 
 enable_breakpoint = False

@@ -4,7 +4,7 @@ use pyo3::prelude::*;
 #[pymodule]
 mod typed_numpy
 {
-    use egglog::ast::{Schema, Expr};
+    use egglog::ast::{Action, Command, Expr, Fact, Schema};
     use egglog::prelude::*;
     use egglog::add_primitive;
     use egglog::sort::{F, OrderedFloat};
@@ -291,31 +291,41 @@ mod typed_numpy
         {
             let egglog_expr = RustExprToEgglogExpr(&expr);
             let expr_id = format!("expr_{}", self.next_id());
-            rule(
-                &mut self.eg,
-                Ruleset,
-                facts![],
-                GenericActions(
-                    vec![Action::Let(span!(), expr_id.clone(), egglog_expr)],
-                ),
+            self.eg.run_program(
+                vec![
+                    Command::Action(
+                        Action::Let(span!(), expr_id.clone(), egglog_expr)
+                    ),
+                ],
             ).map_err(TypedNumpyError::from)?;
             return Ok(expr_id);
         }
 
         fn incrementally_check_equivalence(
             &mut self,
-            a_id : Py<String>,
-            b_id : Py<String>,
+            a_id : &str,
+            b_id : &str,
         ) -> PyResult<bool>
         {
             for _ in 0..10
             {
-                let result = query(
-                    &mut self.eg,
-                    vars![],
-                    facts![(= (unquote a_id.get()) (unquote b_id.get()))],
-                )?;
-                if !result.iter().next().is_none()
+                println!("Running ruleset");
+                run_ruleset(&mut self.eg, Ruleset).map_err(TypedNumpyError::from)?;
+                let check_result = self.eg.run_program(
+                    vec![
+                        Command::Check(
+                            span!(),
+                            vec![
+                                Fact::Eq(
+                                    span!(),
+                                    exprs::var(a_id),
+                                    exprs::var(b_id),
+                                ),
+                            ],
+                        )
+                    ],
+                );
+                if check_result.is_ok()
                 {
                     return Ok(true);
                 }
