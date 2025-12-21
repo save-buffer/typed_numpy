@@ -729,7 +729,7 @@ def expr_types_are_equivalent(
     expected : ExprType,
     actual : ExprType,
     niters : int = 10,
-    use_rust : bool = False,
+    use_rust : bool = True,
 ) -> bool:
     if use_rust:
         return check_if_exprs_equal_rust(expected, actual)
@@ -744,7 +744,7 @@ def expr_simplifies(
     spec : str,
     niters : int = 15,
     dump_to_dot : bool = False,
-    use_rust : bool = False,
+    use_rust : bool = True,
 ) -> bool:
     spec_dt, spec_et = parse_spec_into_type(spec)
     if use_rust:

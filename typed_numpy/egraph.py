@@ -56,7 +56,6 @@ def expr_type_to_rust_expr(expr : ExprType) -> RustExpr:
                     return RustExpr.Max(d, start, end, rust_child)
             raise ValueError(f"Unknown reduction op {op}")
 
-
 def check_if_exprs_equal_rust(x : ExprType, y : ExprType) -> bool:
     egg = RustEgraph()
     x_rust = expr_type_to_rust_expr(x)

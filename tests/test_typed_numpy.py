@@ -1,3 +1,5 @@
+import sys
+
 import numpy as np
 import pytest
 
@@ -292,5 +294,7 @@ tests = [
 
 if __name__ == '__main__':
     for test in tests:
+        print("Running", test)
+        sys.stdout.flush()
         reset_typed_numpy()
         test(None)

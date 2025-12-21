@@ -4,7 +4,7 @@ use pyo3::prelude::*;
 #[pymodule]
 mod typed_numpy
 {
-    use egglog::ast::{Action, Command, Expr, Fact, Schema};
+    use egglog::ast::{Action, Command, Expr, Fact, Rule, Schema};
     use egglog::prelude::*;
     use egglog::add_primitive;
     use egglog::sort::{F, OrderedFloat};
@@ -180,7 +180,22 @@ mod typed_numpy
         add_primitive!(&mut eg, "sin" = |a : F| -> F { F::from(OrderedFloat((**a).sin())) });
         add_primitive!(&mut eg, "cos" = |a : F| -> F { F::from(OrderedFloat((**a).cos())) });
         add_primitive!(&mut eg, "sqrt" = |a : F| -> F { F::from(OrderedFloat((**a).sqrt())) });
-        add_primitive!(&mut eg, "binarymax" = |a : F, b : F| -> F { F::from(OrderedFloat((**a).max(F::from(OrderedFloat(**b))))) });
+        add_primitive!(&mut eg, "binarymax" = |a : F, b : F| -> F { F::from(OrderedFloat((**a).max(**b))) });
+        add_primitive!(&mut eg, "safe_div" = |a : F, b : F| -> F
+            {
+                if (**b) == 0.0 && (**a) >= 0.0
+                {
+                    F::from(OrderedFloat(f64::INFINITY))
+                }
+                else if (**b) == 0.0
+                {
+                    F::from(OrderedFloat(-f64::INFINITY))
+                }
+                else
+                {
+                    F::from(OrderedFloat(**a / **b))
+                }
+            });
 
         add_ruleset(&mut eg, Ruleset)?;
 
@@ -188,7 +203,19 @@ mod typed_numpy
         {
             ($lhs:tt => $rhs:tt) =>
             {
-                rule(&mut eg, Ruleset, facts![(= _lhs $lhs)], actions![(union _lhs $rhs)])?;
+                let mut rule = Rule
+                {
+                    span : span!(),
+                    head : actions![(union _lhs $rhs)],
+                    body : facts![(= _lhs $lhs)].0,
+                    name : "".into(),
+                    ruleset : Ruleset.into(),
+                };
+                rule.name = format!("{rule:?}");
+
+                eg.run_program(
+                    vec![Command::Rule { rule : rule }]
+                )?;
             };
             ($lhs:tt <=> $rhs:tt) =>
             {
@@ -199,6 +226,7 @@ mod typed_numpy
 
         add_rule!((Add a b) => (Add b a)); // commutativity
         add_rule!((Mul a b) => (Mul b a)); // commutativity
+        add_rule!((BinaryMax a b) => (BinaryMax b a)); // commutativity
         add_rule!((Add (Add a b) c) <=> (Add a (Add b c))); // associativity
         add_rule!((Mul (Mul a b) c) <=> (Mul a (Mul b c))); // associativity
         add_rule!((Mul a (Add b c)) <=> (Add (Mul a b) (Mul a c))); // distributivity
@@ -254,10 +282,29 @@ mod typed_numpy
         add_rule!((Add (Constant a) (Constant b)) => (Constant (+ a b))); // constant_folding_add
         add_rule!((Sub (Constant a) (Constant b)) => (Constant (- a b))); // constant_folding_sub
         add_rule!((Mul (Constant a) (Constant b)) => (Constant (* a b))); // constant_folding_mul
-        add_rule!((Div (Constant a) (Constant b)) => (Constant (/ a b))); // constant_folding_div
+
+        // constant_folding_div
+        rule(
+            &mut eg,
+            Ruleset,
+            facts![
+                (= _lhs (Div (Constant a) (Constant b)))
+                (!= b (unquote exprs::float(0.0)))
+            ],
+            actions![(union _lhs (Constant (/ a b)))],
+        )?;
+
+        // add_rule!((Div (Constant a) (Constant b)) => (Constant (/ a b))); 
         add_rule!((BinaryMax (Constant a) (Constant b)) => (Constant (binarymax a b))); // constant_folding_binary_max
-        add_rule!((Exp (Add x y)) <=> (Mul (Exp x) (Exp y))); // product_of_exp
-        add_rule!((Exp (Sub x y)) <=> (Div (Exp x) (Exp y))); // quotient_of_exp
+
+        add_rule!((BinaryMax x (Constant (unquote exprs::float(f64::INFINITY)))) => (Constant (unquote exprs::float(f64::INFINITY)))); // max_with_inf
+        add_rule!((BinaryMax x (Constant (unquote exprs::float(f64::NEG_INFINITY)))) => x); // max_with_neg_inf
+        add_rule!((Add x (Constant (unquote exprs::float(f64::NEG_INFINITY)))) => (Constant (unquote exprs::float(f64::NEG_INFINITY)))); // add_neg_inf
+        add_rule!((Sub (Constant (unquote exprs::float(f64::NEG_INFINITY))) x) => (Constant (unquote exprs::float(f64::NEG_INFINITY)))); // sub_neg_inf
+        add_rule!((Exp (Constant (unquote exprs::float(f64::NEG_INFINITY)))) => (Constant (unquote exprs::float(0.0)))); // exp_neg_inf
+
+        add_rule!((Exp (Add x y)) => (Mul (Exp x) (Exp y))); // product_of_exp
+        add_rule!((Exp (Sub x y)) => (Div (Exp x) (Exp y))); // quotient_of_exp
 
         // log_sum_exp_stability
         add_rule!((Sum D s e (Exp x)) <=>
@@ -332,10 +379,8 @@ mod typed_numpy
                 {
                     println!("Running ruleset iteration {}", i);
                 }
-                let run_result = run_ruleset(
-                    &mut self.eg,
-                    Ruleset,
-                ).map_err(TypedNumpyError::from)?;
+
+                let run_result = self.eg.step_rules(Ruleset).map_err(TypedNumpyError::from)?;
                 if verbose
                 {
                     println!("Ruleset run result: {:#?}", run_result);
