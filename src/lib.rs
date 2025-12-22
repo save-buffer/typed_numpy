@@ -2,13 +2,30 @@ use pyo3::prelude::*;
 
 #[allow(nonstandard_style)]
 #[pymodule]
-mod typed_numpy
+mod _rust
 {
     use egglog::ast::{Action, Command, Expr, Fact, Rule, Schema};
     use egglog::prelude::*;
     use egglog::add_primitive;
     use egglog::sort::{F, OrderedFloat};
     use pyo3::prelude::*;
+    use lazy_static::lazy_static;
+
+    lazy_static!
+    {
+        static ref VERBOSE : bool = std::env::var("EGGLOG_VERBOSE").is_ok();
+    }
+
+    macro_rules! print_if_verbose
+    {
+        ($($args:expr),*) =>
+        {
+            if *VERBOSE
+            {
+                println!($($args,)+);
+            }
+        }
+    }
 
     #[pyclass]
     enum RustExpr
@@ -29,84 +46,84 @@ mod typed_numpy
         Max { dim : String, start : i64, end : i64, x : Py<RustExpr> },
     }
 
-    fn RustExprToEgglogExpr(x : &Py<RustExpr>) -> Expr
+    fn RustExprToEgglogExpr(x : &Py<RustExpr>) -> (Expr, i64)
     {
         match &x.get()
         {
             RustExpr::Constant { value } =>
             {
-                return exprs::call("Constant", vec![exprs::float(*value)]);
+                return (exprs::call("Constant", vec![exprs::float(*value)]), 1);
             }
             RustExpr::Tensor { dims } =>
             {
                 let dim_exprs : Vec<Expr> = dims.iter().map(|d| exprs::string(d)).collect();
                 let dims_set = exprs::call("set-of", dim_exprs);
-                return exprs::call("Tensor", vec![dims_set]);
+                return (exprs::call("Tensor", vec![dims_set]), 1);
             }
             RustExpr::Exp { x } =>
             {
-                let child = RustExprToEgglogExpr(&x);
-                return exprs::call("Exp", vec![child]);
+                let (child, count) = RustExprToEgglogExpr(&x);
+                return (exprs::call("Exp", vec![child]), count + 1);
             }
             RustExpr::Sin { x } =>
             {
-                let child = RustExprToEgglogExpr(&x);
-                return exprs::call("Sin", vec![child]);
+                let (child, count) = RustExprToEgglogExpr(&x);
+                return (exprs::call("Sin", vec![child]), count + 1);
             }
             RustExpr::Cos { x } =>
             {
-                let child = RustExprToEgglogExpr(&x);
-                return exprs::call("Cos", vec![child]);
+                let (child, count) = RustExprToEgglogExpr(&x);
+                return (exprs::call("Cos", vec![child]), count + 1);
             }
             RustExpr::Sqrt { x } =>
             {
-                let child = RustExprToEgglogExpr(&x);
-                return exprs::call("Sqrt", vec![child]);
+                let (child, count) = RustExprToEgglogExpr(&x);
+                return (exprs::call("Sqrt", vec![child]), count + 1);
             }
             RustExpr::Add { x, y } =>
             {
-                let lhs = RustExprToEgglogExpr(&x);
-                let rhs = RustExprToEgglogExpr(&y);
-                return exprs::call("Add", vec![lhs, rhs]);
+                let (lhs, lhs_ct) = RustExprToEgglogExpr(&x);
+                let (rhs, rhs_ct) = RustExprToEgglogExpr(&y);
+                return (exprs::call("Add", vec![lhs, rhs]), lhs_ct + rhs_ct + 1);
             }
             RustExpr::Sub { x, y } =>
             {
-                let lhs = RustExprToEgglogExpr(&x);
-                let rhs = RustExprToEgglogExpr(&y);
-                return exprs::call("Sub", vec![lhs, rhs]);
+                let (lhs, lhs_ct) = RustExprToEgglogExpr(&x);
+                let (rhs, rhs_ct) = RustExprToEgglogExpr(&y);
+                return (exprs::call("Sub", vec![lhs, rhs]), lhs_ct + rhs_ct + 1);
             }
             RustExpr::Mul { x, y } =>
             {
-                let lhs = RustExprToEgglogExpr(&x);
-                let rhs = RustExprToEgglogExpr(&y);
-                return exprs::call("Mul", vec![lhs, rhs]);
+                let (lhs, lhs_ct) = RustExprToEgglogExpr(&x);
+                let (rhs, rhs_ct) = RustExprToEgglogExpr(&y);
+                return (exprs::call("Mul", vec![lhs, rhs]), lhs_ct + rhs_ct + 1);
             }
             RustExpr::Div { x, y } =>
             {
-                let lhs = RustExprToEgglogExpr(&x);
-                let rhs = RustExprToEgglogExpr(&y);
-                return exprs::call("Div", vec![lhs, rhs]);
+                let (lhs, lhs_ct) = RustExprToEgglogExpr(&x);
+                let (rhs, rhs_ct) = RustExprToEgglogExpr(&y);
+                return (exprs::call("Div", vec![lhs, rhs]), lhs_ct + rhs_ct + 1);
             }
             RustExpr::BinaryMax { x, y } =>
             {
-                let lhs = RustExprToEgglogExpr(&x);
-                let rhs = RustExprToEgglogExpr(&y);
-                return exprs::call("BinaryMax", vec![lhs, rhs]);
+                let (lhs, lhs_ct) = RustExprToEgglogExpr(&x);
+                let (rhs, rhs_ct) = RustExprToEgglogExpr(&y);
+                return (exprs::call("BinaryMax", vec![lhs, rhs]), lhs_ct + rhs_ct + 1);
             }
             RustExpr::Repeat { dim, x } =>
             {
-                let child = RustExprToEgglogExpr(&x);
-                return exprs::call("Repeat", vec![exprs::string(dim), child]);
+                let (child, count) = RustExprToEgglogExpr(&x);
+                return (exprs::call("Repeat", vec![exprs::string(dim), child]), count + 1);
             }
             RustExpr::Sum { dim, start, end, x } =>
             {
-                let child = RustExprToEgglogExpr(&x);
-                return exprs::call("Sum", vec![exprs::string(dim), exprs::int(*start), exprs::int(*end), child]);
+                let (child, count) = RustExprToEgglogExpr(&x);
+                return (exprs::call("Sum", vec![exprs::string(dim), exprs::int(*start), exprs::int(*end), child]), count + 1);
             }
             RustExpr::Max { dim, start, end, x } =>
             {
-                let child = RustExprToEgglogExpr(&x);
-                return exprs::call("Max", vec![exprs::string(dim), exprs::int(*start), exprs::int(*end), child]);
+                let (child, count) = RustExprToEgglogExpr(&x);
+                return (exprs::call("Max", vec![exprs::string(dim), exprs::int(*start), exprs::int(*end), child]), count + 1);
             }
         };
     }
@@ -376,8 +393,9 @@ mod typed_numpy
 
         fn insert_expression(&mut self, expr : Py<RustExpr>) -> PyResult<String>
         {
-            let egglog_expr = RustExprToEgglogExpr(&expr);
             let expr_id = format!("expr_{}", self.next_id());
+            let (egglog_expr, nterms) = RustExprToEgglogExpr(&expr);
+            print_if_verbose!("Inserting {} with {} terms", expr_id, nterms);
             self.eg.run_program(
                 vec![
                     Command::Action(
@@ -385,30 +403,23 @@ mod typed_numpy
                     ),
                 ],
             ).map_err(TypedNumpyError::from)?;
+            print_if_verbose!("Done inserting {}", expr_id);
             return Ok(expr_id);
         }
 
-        #[pyo3(signature = (a_id, b_id, verbose=false))]
         fn incrementally_check_equivalence(
             &mut self,
             a_id : &str,
             b_id : &str,
-            verbose : bool,
         ) -> PyResult<bool>
         {
-            let verbose = verbose || std::env::var("EGGLOG_VERBOSE").is_ok();
             for i in 0..10
             {
-                if verbose
-                {
-                    println!("Running ruleset iteration {}", i);
-                }
+                print_if_verbose!("Running ruleset iteration {}", i);
 
                 let run_result = self.eg.step_rules(Ruleset).map_err(TypedNumpyError::from)?;
-                if verbose
-                {
-                    println!("Ruleset run result: {:#?}", run_result);
-                }
+
+                print_if_verbose!("Ruleset run result: {:#?}", run_result);
 
                 let equality_fact = Fact::Eq(
                     span!(),
@@ -425,23 +436,14 @@ mod typed_numpy
                         )
                     ],
                 );
-                if verbose
-                {
-                    println!("Check result: {:#?}", check_result);
-                }
+                print_if_verbose!("Check result: {:#?}", check_result);
                 if check_result.is_ok()
                 {
-                    if verbose
-                    {
-                        println!("Found equivalence at iteration {}", i);
-                    }
+                    print_if_verbose!("Found equivalence at iteration {}", i);
                     return Ok(true);
                 }
             }
-            if verbose
-            {
-                println!("No equivalence found after 10 iterations");
-            }
+            print_if_verbose!("No equivalence found after 10 iterations");
             return Ok(false);
         }
     }

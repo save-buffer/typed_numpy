@@ -279,6 +279,7 @@ def test_flash_attention(reset):
             o = (rescaled_old_o + rescaled_v_proj) / new_l.repeat(dhead).rearrange(qctx, dhead)
             running_l = new_l
             running_max = new_max
+        assert isinstance(o, Typed)
         L.assign(o)
     print("Formally verified Flash Attention passed!")
 

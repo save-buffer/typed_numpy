@@ -6,7 +6,7 @@ from enum import Enum
 from typing import Any, Callable
 
 from .type_nodes import *
-from .typed_numpy import RustEgraph, RustExpr
+from ._rust import RustEgraph, RustExpr # ty: ignore
 
 def expr_type_to_rust_expr(expr : ExprType) -> RustExpr:
     match expr:

@@ -327,7 +327,7 @@ def sqrt(x : Typed) -> Typed:
     new_arr = np.sqrt(x.arr)
     return Typed(new_arr, *new_dim_type, expr_type=new_expr_type)
 
-def max(x : Typed, y : Typed) -> Typed:
+def max(x : Typed | float, y : Typed | float) -> Typed:
     return _binary_op_helper(x, y, "max")
 
 @dataclass

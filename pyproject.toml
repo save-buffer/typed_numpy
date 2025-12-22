@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "typed_numpy"
-requires-python = ">=3.8"
+requires-python = ">=3.11"
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
@@ -16,3 +16,7 @@ dependencies = [
     "numpy>=1.24.4",
     "pytest>=8.3.5",
 ]
+
+[tool.maturin]
+python-source = "python"
+module-name = "typed_numpy._rust"
