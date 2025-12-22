@@ -201,20 +201,52 @@ mod typed_numpy
 
         macro_rules! add_rule
         {
+            ($facts:tt, ($lhs:tt => $rhs:tt)$(,)?) =>
+            {
+                eg.run_program(
+                    vec![
+                        Command::Rule
+                        {
+                            rule : Rule
+                            {
+                                span : span!(),
+                                head : actions![(union _lhs $rhs)],
+                                body : facts![(= _lhs $lhs) $facts].0,
+                                name : concat!(
+                                    "[",
+                                    stringify!($facts),
+                                    "]",
+                                    stringify!($lhs),
+                                    " => ",
+                                    stringify!($rhs),
+                                ).to_string(),
+                                ruleset : Ruleset.into(),
+                            }
+                        }
+                    ]
+                )?;
+
+            };
             ($lhs:tt => $rhs:tt) =>
             {
-                let mut rule = Rule
-                {
-                    span : span!(),
-                    head : actions![(union _lhs $rhs)],
-                    body : facts![(= _lhs $lhs)].0,
-                    name : "".into(),
-                    ruleset : Ruleset.into(),
-                };
-                rule.name = format!("{rule:?}");
-
                 eg.run_program(
-                    vec![Command::Rule { rule : rule }]
+                    vec![
+                        Command::Rule
+                        {
+                            rule : Rule
+                            {
+                                span : span!(),
+                                head : actions![(union _lhs $rhs)],
+                                body : facts![(= _lhs $lhs)].0,
+                                name : concat!(
+                                    stringify!($lhs),
+                                    " => ",
+                                    stringify!($rhs),
+                                ).to_string(),
+                                ruleset : Ruleset.into(),
+                            }
+                        }
+                    ]
                 )?;
             };
             ($lhs:tt <=> $rhs:tt) =>
@@ -268,7 +300,6 @@ mod typed_numpy
         add_rule!((Add (Div a d) (Div b d)) <=> (Div (Add a b) d)); // add_fractions
         add_rule!((Sub (Div a d) (Div b d)) <=> (Div (Sub a b) d)); // sub_fractions
         add_rule!((Mul (Div a c) (Div b d)) <=> (Div (Mul a b) (Mul c d))); // multiply_fractions
-        add_rule!((Div (Mul a b) (Mul c d)) <=> (Mul (Div a c) (Div b d))); // decompose_fractions
         add_rule!((Sub a a) => (Constant (unquote exprs::float(0.0)))); // sub_by_self
         add_rule!((Div a a) => (Constant (unquote exprs::float(1.0)))); // div_by_self
         add_rule!((Add a (Constant (unquote exprs::float(0.0)))) => a); // identity_add
@@ -284,17 +315,10 @@ mod typed_numpy
         add_rule!((Mul (Constant a) (Constant b)) => (Constant (* a b))); // constant_folding_mul
 
         // constant_folding_div
-        rule(
-            &mut eg,
-            Ruleset,
-            facts![
-                (= _lhs (Div (Constant a) (Constant b)))
-                (!= b (unquote exprs::float(0.0)))
-            ],
-            actions![(union _lhs (Constant (/ a b)))],
-        )?;
-
-        // add_rule!((Div (Constant a) (Constant b)) => (Constant (/ a b))); 
+        add_rule!(
+            (!= b (unquote exprs::float(0.0))),
+            ((Div (Constant a) (Constant b)) => (Constant (/ a b))),
+        );
         add_rule!((BinaryMax (Constant a) (Constant b)) => (Constant (binarymax a b))); // constant_folding_binary_max
 
         add_rule!((BinaryMax x (Constant (unquote exprs::float(f64::INFINITY)))) => (Constant (unquote exprs::float(f64::INFINITY)))); // max_with_inf
@@ -386,7 +410,6 @@ mod typed_numpy
                     println!("Ruleset run result: {:#?}", run_result);
                 }
 
-                // Construct the equality fact directly
                 let equality_fact = Fact::Eq(
                     span!(),
                     exprs::var(a_id),
