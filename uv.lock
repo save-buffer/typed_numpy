@@ -154,7 +154,7 @@ wheels = [
 ]
 
 [[package]]
-name = "typed-numpy"
+name = "stile"
 source = { editable = "." }
 dependencies = [
     { name = "einops" },

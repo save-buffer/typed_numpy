@@ -15,12 +15,12 @@ from stile import (
     expr_simplifies,
     rewrite_found,
 )
-from stile.egraph import egraph_enable_breakpoint
 
 @pytest.fixture
 def reset():
     yield
     reset_stile()
+
 
 def test_simple_expression(reset):
     M, N = FullDim('M', 10), FullDim('N', 10)
@@ -29,7 +29,7 @@ def test_simple_expression(reset):
     for i in range(0, 10, 5):
         a_tile = a.slice(M, i, i + 5)
         a_scaled = a_tile * 2
-        b.assign(a_scaled, use_rust=True)
+        b.assign(a_scaled)
 
 
 def test_basic_matmul(reset):
