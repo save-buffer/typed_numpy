@@ -61,3 +61,18 @@ for im in range(0, 10, tile_size):
 While writing the demo above, I originally had the spec be `2 * (M N, N K -> M K)`, and had foolishly
 multiplied both `tile_a` AND `tile_b` by `2`. Obviously this is incorrect, and the type system caught
 the mistake!
+
+## Performance
+The most complicated thing that this system has been tested on is a simple Flash Attention, which
+it can successfully validate (see `tests/test_typed_numpy.py::test_flash_attention`). The size of 
+the expression that we prove grows with the number of _tiles_, meaning a context length of 512 with
+tiles of size 32 will take the same amount of time to prove as a context length of 16,384 with a
+tile size of 1024. In release mode on my Apple M3 Pro 18GB, the time to prove Flash Attention is given
+below as a function of context length.
+
+| Context Length | Number of Tiles | Time   |
+|----------------|-----------------|--------|
+| 128            | 4               | 1.18s  |
+| 256            | 8               | 3.52s  |
+| 512            | 16              | 67.53s |
+
