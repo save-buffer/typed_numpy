@@ -6,7 +6,7 @@ import numpy as np
 import einops
 
 from .type_nodes import *
-from .egraph import Egraph, EclassID, check_if_exprs_equal_rust
+from .verification import verify_exprs_equal
 from .specification import parse_spec_into_type
 
 class Typed:
@@ -337,7 +337,7 @@ def expr_types_are_equivalent(
     actual : ExprType,
     niters : int = 10,
 ) -> bool:
-    return check_if_exprs_equal_rust(expected, actual)
+    return verify_exprs_equal(expected, actual)
 
 def expr_simplifies(
     expr : Typed,
@@ -345,7 +345,7 @@ def expr_simplifies(
     niters : int = 15,
 ) -> bool:
     spec_dt, spec_et = parse_spec_into_type(spec)
-    return check_if_exprs_equal_rust(expr.expr_type, spec_et)
+    return verify_exprs_equal(expr.expr_type, spec_et)
 
 def rewrite_found(
     expr : Typed,
@@ -353,7 +353,7 @@ def rewrite_found(
     niters : int = 5,
 ):
     rw_dt, rw_et = parse_spec_into_type(rewrite)
-    return check_if_exprs_equal_rust(expr.expr_type, rw_et)
+    return verify_exprs_equal(expr.expr_type, rw_et)
 
 class TypedResult:
     def __init__(self, spec : str):
