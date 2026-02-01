@@ -96,17 +96,14 @@ class TypedNumpyArray:
     def __matmul__(self, other) -> "TypedNumpyArray":
         return einsum(self, other, "M N, N K -> M K")
 
-    def assert_equivalent(self, spec : str):
+    def assert_equivalent(self, spec : str, *dim_override : Dim):
         expected_type = parse_spec_into_type(spec)
+        expected_type = override_dims_in_type(expected_type, *dim_override)
         are_equivalent = verify_exprs_equivalent(
-            expected_type.et, 
+            expected_type.et,
             self.type.et,
         )
         assert are_equivalent
-        self.type = Type(
-            self.type.dt,
-            expected_type.et,
-        )
 
 
 def _binary_op_helper(

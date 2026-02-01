@@ -159,6 +159,10 @@ source = { editable = "." }
 dependencies = [
     { name = "einops" },
     { name = "numpy" },
+]
+
+[package.dev-dependencies]
+dev = [
     { name = "pytest" },
 ]
 
@@ -166,5 +170,7 @@ dependencies = [
 requires-dist = [
     { name = "einops", specifier = ">=0.8.1" },
     { name = "numpy", specifier = ">=1.24.4" },
-    { name = "pytest", specifier = ">=8.3.5" },
 ]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=9.0.2" }]

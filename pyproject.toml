@@ -14,9 +14,13 @@ dynamic = ["version"]
 dependencies = [
     "einops>=0.8.1",
     "numpy>=1.24.4",
-    "pytest>=8.3.5",
 ]
 
 [tool.maturin]
 python-source = "python"
 module-name = "stile._rust"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]

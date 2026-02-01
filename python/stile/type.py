@@ -19,7 +19,7 @@ class FullDim:
     def __getitem__(self, i : slice) -> "Sliced":
         return Sliced(
             self,
-            i.start,
+            i.start if i.start is not None else 0,
             i.stop,
         )
 
@@ -377,3 +377,45 @@ def sqrt(x : Type) -> Type:
 def maximum(x : Type | float, y : Type | float) -> Type:
     return type_from_binary_op(x, y, "max")
 
+
+def override_dims_in_type(type : Type, *dim_override : Dim) -> Type:
+    dim_override_by_name = { dim_name(d) : d for d in dim_override }
+
+    def get_overridden(d : Dim):
+        name = dim_name(d)
+        if name in dim_override_by_name:
+            return dim_override_by_name[name]
+        return d
+
+    new_dt = tuple(get_overridden(d) for d in type.dt)
+    
+    def recursively_replace(et : ExprType) -> ExprType:
+        match et:
+            case Constant():
+                return et
+            case Tensor():
+                return et
+            case UnaryOp(op, child):
+                return UnaryOp(
+                    op,
+                    recursively_replace(child),
+                )
+            case BinaryOp(op, lhs, rhs):
+                return BinaryOp(
+                    op,
+                    recursively_replace(lhs),
+                    recursively_replace(rhs),
+                )
+            case Repeat(dim, child):
+                return Repeat(
+                    get_overridden(dim),
+                    recursively_replace(child),
+                )
+            case Reduce(op, dim, child):
+                return Reduce(
+                    op,
+                    get_overridden(dim),
+                    recursively_replace(child)
+                )
+    new_et = recursively_replace(type.et)
+    return Type(new_dt, new_et)

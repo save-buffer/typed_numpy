@@ -1,5 +1,37 @@
 from .type import *
 
+def construct_softmax(child : ExprType, dim : Dim):
+    if False:
+        mx = Repeat(
+            dim=dim_full_dim(dim),
+            child=Reduce(
+                op="max",
+                dim=dim,
+                child=child,
+            ),
+        )
+        centered = BinaryOp(
+            op="-",
+            lhs=child,
+            rhs=mx,
+        )
+    else:
+        centered = child
+    exp = UnaryOp(op="exp", child=centered)
+    sum_exp = Repeat(
+        dim=dim_full_dim(dim),
+        child=Reduce(
+            op="sum",
+            dim=dim,
+            child=exp,
+        ),
+    )
+    return BinaryOp(
+        op="/",
+        lhs=exp,
+        rhs=sum_exp,
+    )
+
 @dataclass
 class LexState:
     spec : str
@@ -246,20 +278,7 @@ def _parse_factor(lex : LexState) -> tuple[DimType, ExprType]:
         dt, et = _parse_paren_expr(lex)
         lex.expect(')')
         if unary_op == "softmax":
-            exp = UnaryOp(op="exp", child=et)
-            sum_exp = Repeat(
-                dim=dim_full_dim(dim_annotation),
-                child=Reduce(
-                    op="sum",
-                    dim=dim_annotation,
-                    child=exp,
-                ),
-            )
-            return dt, BinaryOp(
-                op="/",
-                lhs=exp,
-                rhs=sum_exp,
-            )
+            return dt, construct_softmax(et, dim_annotation)
 
         return dt, UnaryOp(
             op=unary_op, # ty: ignore

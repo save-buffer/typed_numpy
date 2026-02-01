@@ -30,14 +30,18 @@ enough to prove a tiled Flash Attention kernel!
 
 ## Example
 ```python
-M, N, K = FullDim('M', 10), FullDim('N', 10), FullDim('K', 10)
-a = Typed(np.random.randn(10, 10), M, N)
-b = Typed(np.random.randn(10, 10), N, K)
-c = TypedResult("6 * (M N, N K -> M K)")
+from stile import dim
+
+import style.numpy as tnp # tnp is Typed Numpy
+
+M, N, K = dim('M', 10), dim('N', 10), dim('K', 10)
+a = tnp.randn(M, N)
+b = tnp.randn(N, K)
+c = tnp.TypedResult("6 * (M N, N K -> M K)")
 
 for im in range(0, 10, tile_size):
     for ik in range(0, 10, tile_size):
-        c_accum = None
+        c_accum = 0
         for in_ in range(0, 10, tile_size):
             # Slice the inputs
             tile_a = a.slice(M, im, im + tile_size).slice(N, in_, in_ + tile_size)
@@ -48,9 +52,9 @@ for im in range(0, 10, tile_size):
             tile_a_scaled = tile_a * 3
             tile_b_scaled = tile_b * 2
             # Perform a single tile's worth of matmul
-            tile_c = einsum(tile_a_scaled, tile_b_scaled, "M N, N K -> M K")
+            tile_c = tnp.einsum(tile_a_scaled, tile_b_scaled, "M N, N K -> M K")
             # Accumulate the result
-            c_accum = c_accum + tile_c if c_accum is not None else tile_c
+            c_accum = c_accum + tile_c
         # Write it out to the result tensor! Notice that if we'd done something NOT according
         # to the specification, we would not be able to assign here. For instance, if our dimensions
         # were mismatching, or we failed to reduce the entire dimension, or if we accidentally multiplied

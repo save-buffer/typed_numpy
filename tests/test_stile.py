@@ -258,6 +258,11 @@ def test_flash_attention(reset):
             o = (rescaled_old_o + rescaled_v_proj) / new_l.repeat(dhead).rearrange(qctx, dhead)
             running_l = new_l
             running_max = new_max
+            o.assert_equivalent(
+                "((softmax[nctx](qctx dhead, nctx dhead -> qctx nctx) / sqrt(16)), nctx dhead -> qctx dhead)",
+                nctx[:(ictx + nctx_tile_size)],
+            )
+
         assert isinstance(o, tnp.TypedNumpyArray)
         L.assign(o)
     print("Formally verified Flash Attention passed!")
