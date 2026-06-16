@@ -17,6 +17,7 @@ from ._core import (
     mask,
     runtime_index,
     tensor,
+    axiom,
 )
 from ..indexing import runtime_scalar
 

@@ -658,14 +658,23 @@ def _as_single_factor(product : "NormalizedProduct") -> "NormalizedFactor | None
     return factor if count == 1 else None
 
 def _flatten_sum_terms(terms) -> list["NormalizedProduct"]:
-    """Expand any term that is itself a wrapped NormalizedSum into its children."""
+    """Expand any term that is itself a wrapped NormalizedSum into its
+    children. A scalar-times-sum term ``c * (x + y + ...)`` distributes the
+    constant into each child so it joins the parent sum as ``c*x, c*y, ...``
+    — the scalar-distribution case of the distributive law, which is always
+    size-preserving (one product in, |children| products out, no cross
+    terms)."""
     out : list[NormalizedProduct] = []
     for t in terms:
-        factor = _as_single_factor(t)
-        if isinstance(factor, NormalizedSum):
-            out.extend(factor.children)
-        else:
-            out.append(t)
+        if len(t.factors) == 1:
+            factor, count = next(iter(t.factors.items()))
+            if count == 1 and isinstance(factor, NormalizedSum):
+                out.extend(
+                    NormalizedProduct(const=t.const * c.const, factors=c.factors)
+                    for c in factor.children
+                )
+                continue
+        out.append(t)
     return out
 
 def _rebuild_reduce_with_extras(

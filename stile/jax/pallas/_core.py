@@ -57,13 +57,15 @@ class OutputSpec:
         (positional, in call order) returning the expected
         `TypedJaxArray` (e.g. `lambda x: x * 2`). A reference is run on
         the actual call-time inputs to extract its `ExprType`; no spec
-        string needed.
+        string needed. May be ``None`` only when a top-level
+        ``reference=`` is supplied to ``typed_pallas_call`` — the
+        reference then provides this output's expected expression.
       - `st`: the output's `ShapeType` (the dim signature, possibly
         sliced). Doesn't have to match `spec`'s shape verbatim — slice
         overrides happen via `verify_types_equivalent`.
       - `dt`: the output's dtype.
     """
-    spec : "str | Callable"
+    spec : "str | Callable | None"
     st : ShapeType
     dt : DataType | None = None
 
@@ -165,10 +167,70 @@ def _derive_sliced_st(parent_st, block_spec, pids):
     return tuple(sliced)
 
 
+def _normalize_out_types(out_type):
+    """Return ``(tuple_of_OutputSpec, was_single)`` for either form."""
+    if isinstance(out_type, OutputSpec):
+        return (out_type,), True
+    return tuple(out_type), False
+
+
+def _out_struct(spec : OutputSpec):
+    dims = tuple(as_int(dim_size(d)) for d in spec.st)
+    return jax.ShapeDtypeStruct(dims, spec.dt if spec.dt is not None else jnp.float32)
+
+
+def _resolve_spec_ets(out_types, typed_inputs, reference):
+    """
+    Resolve each output's expected ``ExprType``.
+
+    With a top-level ``reference`` (a tjax callable over the typed
+    inputs returning one ``TypedJaxArray`` per output), run it once and
+    take each return value's ``.type.et`` — checking shape/dtype against
+    the declared ``OutputSpec``. Otherwise fall back to the per-output
+    ``spec`` (string or callable) via ``_resolve_spec_et``.
+    """
+    if reference is None:
+        for ot in out_types:
+            if ot.spec is None:
+                raise ValueError(
+                    "OutputSpec.spec is None but typed_pallas_call has no "
+                    "reference= — supply one or the other."
+                )
+        return [_resolve_spec_et(ot, typed_inputs) for ot in out_types]
+    for ot in out_types:
+        if ot.spec is not None:
+            raise ValueError(
+                "typed_pallas_call: pass either reference= or per-output "
+                "OutputSpec.spec, not both."
+            )
+    ref_inputs = [
+        TypedJaxArray(
+            ti.arr,
+            Type(ti.type.st, ti.type.et, dtype_to_datatype(ti.arr.dtype)),
+        )
+        for ti in typed_inputs
+    ]
+    outs = run_reference(reference, ref_inputs)
+    if len(outs) != len(out_types):
+        raise ValueError(
+            f"typed_pallas_call reference returned {len(outs)} value(s) but "
+            f"out_type declares {len(out_types)}."
+        )
+    ets = []
+    for out, ot in zip(outs, out_types):
+        check_output_against_declaration(
+            out.type, ot.st, dtype_to_datatype(ot.dt),
+            label="typed_pallas_call reference",
+        )
+        ets.append(out.type.et)
+    return ets
+
+
 def typed_pallas_call(
     kernel_fn,
-    out_type : OutputSpec,
+    out_type : "OutputSpec | tuple[OutputSpec, ...] | list[OutputSpec]",
     *,
+    reference : "Callable | None" = None,
     grid=None,
     in_specs=None,
     out_specs=None,
@@ -177,9 +239,25 @@ def typed_pallas_call(
 ):
     """
     Wrap a Pallas kernel function with stile typing. The user's
-    `kernel_fn` takes `TypedRef`s for each input followed by a
-    `TypedOutputRef`. The returned callable takes `TypedJaxArray`
-    inputs and produces a `TypedJaxArray` output.
+    `kernel_fn` takes one ref per input followed by one
+    `TypedOutputRef` per output. The returned callable takes typed (or
+    raw) inputs and produces a `TypedJaxArray` (or tuple thereof).
+
+    **Multi-output**: pass a tuple/list of `OutputSpec` for `out_type`.
+    The kernel receives that many `TypedOutputRef`s; the runner returns
+    that many `TypedJaxArray`s. A single `OutputSpec` keeps the
+    single-value calling convention.
+
+    **Untyped passthrough**: an input that is *not* a `TypedJaxArray`
+    is forwarded as a raw `jax.Array` and the kernel receives the bare
+    Pallas ref for it — for index tables, peer/slot tables, and other
+    operands the verifier should not see.
+
+    **Reference verification**: instead of per-output spec strings,
+    pass ``reference=`` — a tjax callable over the typed inputs (in
+    call order, untyped inputs skipped) that returns one
+    ``TypedJaxArray`` per output. The kernel is then proven equivalent
+    to whatever the reference computes; no spec language needed.
 
     For tiled kernels, pass `grid` (a tuple of grid axis sizes) and
     `in_specs` / `out_specs` (raw `pl.BlockSpec`s, one per input /
@@ -195,21 +273,27 @@ def typed_pallas_call(
     identical ASTs — let the dev loop be local, the perf loop be
     remote.
     """
-    out_shape_dims = tuple(as_int(dim_size(d)) for d in out_type.st)
-    out_dtype = out_type.dt if out_type.dt is not None else jnp.float32
-    out_struct = jax.ShapeDtypeStruct(out_shape_dims, out_dtype)
+    out_types, single_out = _normalize_out_types(out_type)
+    out_structs = tuple(_out_struct(s) for s in out_types)
 
     tiled = grid is not None
 
-    def runner(*typed_inputs : TypedJaxArray):
-        # Resolve the expected output ExprType once — from a spec string or
-        # by running the reference on these inputs (which also checks the
-        # reference's output ShapeType / dtype against the declaration).
-        spec_et = _resolve_spec_et(out_type, typed_inputs)
+    def runner(*inputs):
+        n_in = len(inputs)
+        # Untyped inputs pass through to Pallas unchanged; typed inputs
+        # contribute their `.arr`.
+        raw_inputs = [
+            ti.arr if isinstance(ti, TypedJaxArray) else ti for ti in inputs
+        ]
+        typed_only = [ti for ti in inputs if isinstance(ti, TypedJaxArray)]
+        # Resolve each output's expected ExprType once — from a top-level
+        # reference, a per-output spec string, or a per-output reference.
+        # The reference sees only typed inputs, in call order.
+        spec_ets = _resolve_spec_ets(out_types, typed_only, reference)
 
         def jax_kernel(*refs):
-            input_refs = refs[:len(typed_inputs)]
-            output_ref = refs[len(typed_inputs)]
+            input_refs = refs[:n_in]
+            output_refs = refs[n_in : n_in + len(out_types)]
             if tiled:
                 # `tiled` implies these were all supplied together.
                 assert grid is not None and in_specs is not None and out_specs is not None
@@ -224,47 +308,57 @@ def typed_pallas_call(
                     f"_pid_{i}": pl.program_id(i) for i in range(len(grid))
                 }
                 wrapped_inputs = []
-                for ref, ti, spec in zip(input_refs, typed_inputs, in_specs):
+                for ref, ti, spec in zip(input_refs, inputs, in_specs):
+                    if not isinstance(ti, TypedJaxArray):
+                        wrapped_inputs.append(ref)
+                        continue
                     sliced_st = _derive_sliced_st(ti.type.st, spec, pids)
                     wrapped_inputs.append(
                         TypedRef(ref, Type(sliced_st, ti.type.et, ti.type.dt))
                     )
-                # Output: the spec describes the FULL output; restrict it
-                # to the tile via override_dims_in_type so per-block
+                # Outputs: each spec describes the FULL output; restrict
+                # it to the tile via override_dims_in_type so per-block
                 # assign certifies the tile, not the global tensor.
-                sliced_out_st = _derive_sliced_st(out_type.st, out_specs, pids)
-                full_spec_type = Type(out_type.st, spec_et, out_type.dt)
-                tile_spec = override_dims_in_type(full_spec_type, *sliced_out_st)
-                wrapped_output = TypedOutputRef(
-                    output_ref,
-                    Type(sliced_out_st, tile_spec.et, out_type.dt),
-                    out_type,
+                out_specs_seq = (
+                    out_specs if isinstance(out_specs, (list, tuple)) else (out_specs,)
                 )
+                wrapped_outputs = []
+                tile_overrides : list = []
+                for ref, ot, et, pl_spec in zip(
+                    output_refs, out_types, spec_ets, out_specs_seq,
+                ):
+                    sliced_st = _derive_sliced_st(ot.st, pl_spec, pids)
+                    full_spec_type = Type(ot.st, et, ot.dt)
+                    tile_spec = override_dims_in_type(full_spec_type, *sliced_st)
+                    wrapped_outputs.append(TypedOutputRef(
+                        ref, Type(sliced_st, tile_spec.et, ot.dt), ot,
+                    ))
+                    tile_overrides.extend(
+                        d for d in sliced_st if isinstance(d, Sliced)
+                    )
                 # The tile context: every Sliced dim that the kernel
                 # body operates on. Inner `tjax.fori_loop(..., invariant=...)`
                 # calls read this stack to restrict their parsed
                 # invariant types to the tile, so the body's Sliced
                 # types match the invariant's during verification.
-                tile_overrides = tuple(
-                    d for d in sliced_out_st if isinstance(d, Sliced)
-                )
-                _g_active_tile_overrides.append(tile_overrides)
+                _g_active_tile_overrides.append(tuple(tile_overrides))
                 try:
                     with loop_var_binding(pid_runtime):
-                        kernel_fn(*wrapped_inputs, wrapped_output)
+                        kernel_fn(*wrapped_inputs, *wrapped_outputs)
                 finally:
                     _g_active_tile_overrides.pop()
             else:
                 wrapped_inputs = [
                     TypedRef(ref, ti.type)
-                    for ref, ti in zip(input_refs, typed_inputs)
+                    if isinstance(ti, TypedJaxArray)
+                    else ref
+                    for ref, ti in zip(input_refs, inputs)
                 ]
-                wrapped_output = TypedOutputRef(
-                    output_ref,
-                    Type(out_type.st, spec_et, out_type.dt),
-                    out_type,
-                )
-                kernel_fn(*wrapped_inputs, wrapped_output)
+                wrapped_outputs = [
+                    TypedOutputRef(ref, Type(ot.st, et, ot.dt), ot)
+                    for ref, ot, et in zip(output_refs, out_types, spec_ets)
+                ]
+                kernel_fn(*wrapped_inputs, *wrapped_outputs)
 
         pallas_kwargs = {}
         if tiled:
@@ -273,19 +367,21 @@ def typed_pallas_call(
             )
         if compiler_params is not None:
             pallas_kwargs['compiler_params'] = compiler_params
-        result_arr = pl.pallas_call(
+        result = pl.pallas_call(
             jax_kernel,
-            out_shape=out_struct,
+            out_shape=out_structs[0] if single_out else out_structs,
             interpret=interpret,
             **pallas_kwargs,
-        )(*[ti.arr for ti in typed_inputs])
+        )(*raw_inputs)
 
-        # The returned TypedJaxArray's Type uses the resolved ExprType (so
+        # The returned TypedJaxArrays carry the resolved ExprTypes (so
         # downstream consumers see the spec / reference, not the kernel's
-        # internal expression) and the OutputSpec's ShapeType.
-        return TypedJaxArray(
-            result_arr,
-            Type(out_type.st, spec_et, out_type.dt),
+        # internal expression) and each OutputSpec's ShapeType.
+        result_arrs = (result,) if single_out else tuple(result)
+        typed_outs = tuple(
+            TypedJaxArray(arr, Type(ot.st, et, ot.dt))
+            for arr, ot, et in zip(result_arrs, out_types, spec_ets)
         )
+        return typed_outs[0] if single_out else typed_outs
 
     return runner

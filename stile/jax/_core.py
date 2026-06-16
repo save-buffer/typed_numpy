@@ -8,6 +8,7 @@ except ImportError:
     ) from None
 
 import functools
+import hashlib
 import inspect
 import math
 from typing import Any, cast
@@ -771,7 +772,86 @@ def einsum(x : TypedJaxArray, y : TypedJaxArray, einstr : str) -> TypedJaxArray:
     )
 
 
-def fori_loop(lower, upper, body_fn, init_val, *, invariant=None):
+def _fori_body_signature(lower, upper, ref_body, init_val):
+    """
+    A stable string signature for a body-equivalence ``fori_loop``:
+    captures ``(lower, upper, normalized init ets, normalized body-output
+    ets)`` so two loops over the same range with init values and bodies
+    that normalize identically produce identical output leaves. The body
+    is traced once with a symbolic ``k`` and fresh named-tensor carry
+    leaves; only the body's *function* (its output ets in terms of those
+    leaves) enters the signature, not its Python identity.
+    """
+    is_tuple = isinstance(init_val, tuple)
+    init_leaves = list(init_val) if is_tuple else [init_val]
+    init_ets = tuple(_normalize_state_leaf(l) for l in init_leaves)
+    k_var = LoopVariable("k")
+    sym_carry = []
+    for i, leaf in enumerate(init_leaves):
+        st = leaf.type.st if isinstance(leaf, TypedJaxArray) else ()
+        full = tuple(dim_full_dim(d) for d in st)
+        sym_carry.append(TypedJaxArray(
+            None, Type(st, t.Tensor(dims=full, name=f"_carry_{i}"), None),
+        ))
+    sym_state = tuple(sym_carry) if is_tuple else sym_carry[0]
+    out = ref_body(k_var, sym_state)
+    out_leaves = list(out) if isinstance(out, tuple) else [out]
+    out_ets = tuple(_normalize(l.type.et) for l in out_leaves)
+    return repr((as_int(lower), as_int(upper), init_ets, out_ets)), out_leaves
+
+
+def _fori_loop_body_equiv(lower, upper, body_fn, init_val, reference_body):
+    """
+    Body-equivalence ``fori_loop``: prove ``body_fn(k, carry) ≡
+    reference_body(k, carry)`` for symbolic ``k`` and fresh-leaf carry,
+    then return per-carry ``TypedJaxArray``s whose ``et`` is a named
+    leaf derived from the loop's signature. Two loops with the same
+    bounds, init types, and reference body (up to normalization) produce
+    identical output ets — so a kernel loop and a reference loop over
+    the same ``reference_body`` verify equal downstream.
+
+    This is the mode for recursive carries with no closed-form invariant
+    (e.g. a resblock stack): equal init + equal body ⇒ equal final, by
+    induction; the verifier discharges the body step and the signature
+    encodes the rest.
+    """
+    sig, ref_out = _fori_body_signature(lower, upper, reference_body, init_val)
+    if body_fn is not reference_body:
+        _, body_out = _fori_body_signature(lower, upper, body_fn, init_val)
+        if len(body_out) != len(ref_out):
+            raise AssertionError(
+                "fori_loop body and reference_body return different arities."
+            )
+        for i, (bo, ro) in enumerate(zip(body_out, ref_out)):
+            if not verify_exprs_equivalent(bo.type.et, ro.type.et):
+                raise AssertionError(
+                    f"fori_loop body does not match reference_body at carry "
+                    f"index {i}."
+                )
+    h = hashlib.sha256(sig.encode()).hexdigest()[:16]
+    is_tuple = isinstance(init_val, tuple)
+    final = []
+    for i, leaf in enumerate(ref_out):
+        st = leaf.type.st
+        full = tuple(dim_full_dim(d) for d in st)
+        final.append(TypedJaxArray(
+            None, Type(st, t.Tensor(dims=full, name=f"_fori_{h}_{i}"), None),
+        ))
+    # Runtime: under a Pallas/jit trace, lower to jax.lax.fori_loop so the
+    # kernel actually computes. The reference path keeps arr=None.
+    init_leaves = list(init_val) if is_tuple else [init_val]
+    if any(
+        isinstance(l, TypedJaxArray) and isinstance(l.arr, jax.core.Tracer)
+        for l in init_leaves
+    ) or _g_jit_trace_depth[0] > 0:
+        rt = _fori_loop_jax_traced(as_int(lower), as_int(upper), body_fn, init_val)
+        rt_leaves = list(rt) if is_tuple else [rt]
+        for f, r in zip(final, rt_leaves):
+            f.arr = r.arr if isinstance(r, TypedJaxArray) else r
+    return tuple(final) if is_tuple else final[0]
+
+
+def fori_loop(lower, upper, body_fn, init_val, *, invariant=None, reference_body=None):
     """
     Verification-mode analogue of `jax.lax.fori_loop`. Two paths:
 
@@ -787,9 +867,19 @@ def fori_loop(lower, upper, body_fn, init_val, *, invariant=None):
       returns a typed value with `et = invariant[k=upper]`. Cost is
       invariant to the trip count.
 
+    - **Body equivalence** (``reference_body=``): for recursive carries
+      with no closed-form invariant. Prove ``body_fn(k, carry) ≡
+      reference_body(k, carry)`` once with symbolic ``k`` and fresh-leaf
+      carry; the result's type is a deterministic leaf so two loops over
+      the same reference body verify equal.
+
     Signature mirrors `jax.lax.fori_loop`; same user code lowers to
     real `jax.lax.fori_loop` at runtime.
     """
+    if reference_body is not None:
+        if invariant is not None:
+            raise ValueError("fori_loop: pass invariant or reference_body, not both")
+        return _fori_loop_body_equiv(lower, upper, body_fn, init_val, reference_body)
     # Tracer dispatch first: when we're inside a jax-traced execution
     # (typically under `tjax.jit`'s jit-compiled wrapper), defer to
     # `jax.lax.fori_loop`. Two ways this can happen — either a bound
@@ -1229,6 +1319,37 @@ def tensor(
     """
     full_dims = tuple(dim_full_dim(d) for d in shape)
     type = Type(st=full_dims, et=t.Tensor(dims=full_dims, name=name))
+    return TypedJaxArray(arr, type)
+
+
+def axiom(
+    arr,
+    *shape : Dim,
+    name : "str | None" = None,
+    spec : "str | None" = None,
+) -> TypedJaxArray:
+    """
+    Declare — without proof — that ``arr`` has the given stile type.
+
+    Use to wrap the result of an untyped Pallas block (a collective,
+    a hand-tuned DMA pipeline, anything the verifier can't see through)
+    so the typed kernel around it can keep composing. The verifier
+    treats the result as an opaque named leaf when ``name`` is given,
+    or as the parsed ``spec`` expression when ``spec`` is given.
+
+    Exactly one of ``name`` and ``spec`` must be provided. ``arr`` may
+    be ``None`` (symbolic-only path); ``shape`` is the result's
+    `ShapeType` (full dims; sliced dims are accepted and kept as-is).
+    """
+    if (name is None) == (spec is None):
+        raise ValueError("axiom: pass exactly one of name= or spec=")
+    if spec is not None:
+        type = parse_spec_into_type(spec)
+        if shape:
+            type = Type(shape, type.et, type.dt)
+        return TypedJaxArray(arr, type)
+    full_dims = tuple(dim_full_dim(d) for d in shape)
+    type = Type(st=shape, et=t.Tensor(dims=full_dims, name=name))
     return TypedJaxArray(arr, type)
 
 
