@@ -6,6 +6,7 @@ from .indexing import (
     AffineExpr, LoopVariable, Domain, to_affine,
     domain as _indexing_domain,
     le, lt, ge, gt, eq, free_vars, and_domains, or_domains,
+    runtime_scalar_names,
 )
 
 
@@ -672,7 +673,7 @@ def _parse_affine_identifier(lex : LexState) -> LoopVariable:
     while i < len(lex.spec) and _is_ident_cont(lex.spec[i]):
         i += 1
     word = lex.spec[:i]
-    if word in _g_extra_loop_vars:
+    if word in _g_extra_loop_vars or word in runtime_scalar_names():
         lex.spec = lex.spec[i:]
         return LoopVariable(word)
     d = _parse_dim_name(lex)

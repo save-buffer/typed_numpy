@@ -24,26 +24,37 @@ try:
     import jax
     import jax.numpy as jnp
     import jax.experimental.pallas as pl
+    import jax.experimental.pallas.tpu as pltpu
 except ImportError:
     raise ImportError(
         "Pallas support requires the jax extra: pip install stile[jax]"
     ) from None
 
+import hashlib
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
 
 from ...type import (
     Type, ShapeType, DataType, Sliced, dim_size, dim_full_dim, as_int,
-    simplify_dim, override_dims_in_type,
+    simplify_dim, override_dims_in_type, TagCond, Tensor, Constant,
+    type_from_binary_op,
 )
-from ...indexing import LoopVariable
+from ...indexing import LoopVariable, SymbolicInt, Domain
 from ...specification import parse_spec_into_type
-from ...verification import verify_types_equivalent
+from ...verification import verify_types_equivalent, normalize, verify_exprs_equivalent
 from ...reference import run_reference, check_output_against_declaration
+from .. import _core as tjax_core
 from .._core import (
     TypedJaxArray, loop_var_binding, _g_active_tile_overrides,
-    dtype_to_datatype,
+    dtype_to_datatype, _resolve_to_runtime,
 )
+
+# Bind concrete values for ``runtime_scalar(...)``s so a ``.where("B < n")``
+# predicate can materialize its mask array. Same mechanism the tiled path
+# uses for ``_pid_<i>``; exposed here for callers that drive the runner
+# directly. The structural proof never needs the binding — only the
+# numerical ``arr`` does.
+bound_runtime_scalars = loop_var_binding
 
 
 @dataclass
@@ -83,6 +94,464 @@ class TypedRef:
 
     def load(self) -> TypedJaxArray:
         return TypedJaxArray(self.ref[...], self.type)
+
+    def typed_value(self) -> TypedJaxArray:
+        """Type-only load (``arr=None``) — for value-style reference bodies
+        that need the input's type without emitting a runtime ref read."""
+        return TypedJaxArray(None, self.type)
+
+    def at(self, *idx) -> "TypedRef":
+        """
+        Index the underlying ref (``self.ref.at[*idx]``) and drop the
+        consumed leading dims from the type's ``ShapeType``. The
+        ``ExprType`` stays the original leaf — under
+        ``tpl.fori_loop``'s body-equivalence trace there is one
+        ``.at(layer)`` call, so "the layer-``k`` slice" is the same leaf
+        for the proof. The result is a ``TypedRef`` you can
+        ``.copy_from``/``.load()`` or hand to a raw block via ``.ref``.
+
+        Each ``idx`` entry consumes one leading dim (an int / scalar
+        tracer / ``SymbolicInt``) or keeps it (a ``pl.ds`` / ``slice``).
+        A ``SymbolicInt`` with no ``runtime_value`` (type-only reference
+        body) skips the ref index — the result's ``.ref`` is ``None``
+        and only ``.typed_value()`` is valid.
+        """
+        rt_idx = tuple(
+            i.runtime_value if isinstance(i, SymbolicInt) else i for i in idx
+        )
+        n_drop = sum(
+            0 if isinstance(i, (slice,)) or hasattr(i, "start") else 1 for i in rt_idx
+        )
+        new_type = Type(self.type.st[n_drop:], self.type.et, self.type.dt)
+        if any(i is None for i in rt_idx):
+            return TypedRef(None, new_type)
+        return TypedRef(
+            self.ref.at[rt_idx if len(rt_idx) > 1 else rt_idx[0]], new_type
+        )
+
+
+@dataclass
+class ScratchSpec:
+    """
+    Declares a real Pallas VMEM scratch ref for ``typed_pallas_call``.
+
+    A ``scratch=`` entry that is a :class:`ScratchSpec` (rather than a
+    bare name) is allocated via ``pl.pallas_call(scratch_shapes=...)`` —
+    the kernel receives a :class:`TypedScratchRef` wrapping the real
+    Pallas ref, so ``.store(x)``/``.load()`` are real VMEM writes/reads
+    and ``.copy_from(hbm_ref)`` lowers to a real DMA. A bare-name entry
+    keeps the Python-level-holder behavior (no allocation; the type
+    flows through but the storage indirection is elided).
+    """
+    name : str
+    shape : tuple
+    dtype : "jnp.dtype" = jnp.float32
+
+
+class TypedScratchRef:
+    """
+    A VMEM-style scratch ref — a typed mutable cell with no spec.
+
+    Models the Pallas pattern of staging an intermediate through a VMEM
+    scratch buffer: DMA a weight in, compute on it, stash an
+    intermediate, read it back later. Unlike :class:`TypedOutputRef`,
+    :meth:`store` does *not* verify — it records the stored value's
+    :class:`Type` so a subsequent :meth:`load` returns a
+    :class:`TypedJaxArray` carrying the same expression. The verifier
+    sees scratch as a no-op rename; only the final ``.assign()`` on an
+    output ref is checked against the reference.
+
+    With a real Pallas ref (declared via :class:`ScratchSpec`),
+    ``.store(x)`` writes ``ref[...] = x.arr`` and ``.load()`` reads
+    ``ref[...]``; ``.copy_from(typed_input_ref)`` does
+    ``ref[...] = src_ref[...]`` — Mosaic lowers that as an HBM→VMEM
+    DMA. Without a real ref (bare-name scratch), the same calls are a
+    Python-level rename: the held ``TypedJaxArray.arr`` is a JAX tracer
+    and the storage indirection is elided. The type-level result is
+    identical either way.
+    """
+    def __init__(
+        self, name : "str | None" = None, ref=None,
+        *, slot : "_PartSlot | None" = None, parent=None,
+    ):
+        self._type : "Type | None" = None
+        self._name = name
+        self._ref = ref
+        self._held_arr = None
+        # ``slot``/``parent`` are set when this ref is a view into an
+        # ``UntypedScratch`` block; ``load()`` propagates them onto the
+        # returned ``TypedJaxArray`` so list-form ``einsum`` can coalesce.
+        self._slot = slot
+        self._parent = parent
+
+    def store(self, value : TypedJaxArray) -> None:
+        if not isinstance(value, TypedJaxArray):
+            raise TypeError(
+                f"TypedScratchRef.store expects a TypedJaxArray; got "
+                f"{type(value).__name__}"
+            )
+        self._type = value.type
+        if self._ref is not None:
+            self._ref[...] = value.arr
+        else:
+            self._held_arr = value.arr
+
+    def load(self) -> TypedJaxArray:
+        if self._type is None:
+            who = f" {self._name!r}" if self._name else ""
+            raise ValueError(f"scratch ref{who} loaded before any store")
+        arr = self._ref[...] if self._ref is not None else self._held_arr
+        return TypedJaxArray(
+            arr, self._type, slot=self._slot, parent=self._parent,
+        )
+
+    def copy_from(self, src : "TypedJaxArray | TypedRef") -> None:
+        """
+        An HBM→VMEM DMA. With a real scratch ref and a :class:`TypedRef`
+        source, emits ``pltpu.sync_copy(src_ref, self_ref)`` — Mosaic's
+        only sanctioned way to read an ``ANY``-memory-space ref. With a
+        Python-holder scratch the source must be VMEM/SMEM-loadable. The
+        verifier sees the DMA as the identity: the scratch's type becomes
+        ``src``'s.
+        """
+        if isinstance(src, TypedRef):
+            self._type = src.type
+            if self._ref is not None:
+                pltpu.sync_copy(src.ref, self._ref)
+            else:
+                self._held_arr = src.ref[...]
+        else:
+            self.store(src)
+
+    def axiom(self, declared : TypedJaxArray) -> None:
+        """
+        Declare — without proof — that this scratch ref now holds
+        ``declared``'s expression. Use after a raw-Pallas block (a
+        collective, a hand-tuned DMA pipeline) wrote the ref via
+        ``self._ref`` directly: the verifier didn't see that write, so
+        ``.axiom(x)`` records ``x.type`` for the next ``.load()``. Does
+        *not* touch the ref (the raw block already did); contrast with
+        :meth:`store`, which both writes and types.
+
+        The typical pattern with the explicit-device model from
+        ``collectives.py``::
+
+            _trivance_ar_body(peer_ref, ar_in._ref, ar_out._ref, ...)
+            ar_out.axiom(ar_in.load().sum(dev))
+        """
+        if not isinstance(declared, TypedJaxArray):
+            raise TypeError(
+                f"axiom expects a TypedJaxArray; got {type(declared).__name__}"
+            )
+        self._type = declared.type
+        if self._ref is None:
+            self._held_arr = declared.arr
+
+    @property
+    def ref(self):
+        """The underlying Pallas ref (real-ref scratch only) — for handing
+        to a raw-Pallas block that writes it directly. Pair with
+        :meth:`axiom` to declare the typed effect afterwards."""
+        if self._ref is None:
+            raise ValueError(
+                f"scratch ref {self._name!r} is a Python-level holder; "
+                f"declare via ScratchSpec/UntypedScratchSpec for a real ref"
+            )
+        return self._ref
+
+    def copy_from_async(self, src : "TypedRef", sem) -> "_AsyncDma":
+        """
+        Start an async HBM→VMEM DMA and return a handle whose
+        :meth:`_AsyncDma.wait` blocks on completion. The scratch's type
+        is recorded immediately (the verifier sees the DMA as identity,
+        so a :meth:`load` after :meth:`_AsyncDma.wait` carries ``src``'s
+        type); the runtime emits ``pltpu.make_async_copy(src, self,
+        sem)`` so compute between ``start`` and ``wait`` overlaps the
+        transfer. Real-ref scratch only; ``sem`` is a raw Pallas DMA
+        semaphore (declared via ``scratch=`` as ``pltpu.SemaphoreType.DMA``
+        passthrough — semaphores carry no type).
+        """
+        if self._ref is None:
+            raise ValueError(
+                "copy_from_async requires a real scratch ref (declare via "
+                "ScratchSpec/UntypedScratchSpec)"
+            )
+        self._type = src.type
+        dma = pltpu.make_async_copy(src.ref, self._ref, sem)
+        dma.start()
+        return _AsyncDma(dma)
+
+
+@dataclass
+class _AsyncDma:
+    """Handle from :meth:`TypedScratchRef.copy_from_async`."""
+    _dma : "object"
+
+    def wait(self) -> None:
+        self._dma.wait()
+
+
+def _domain_runtime_bool(dom : Domain):
+    """Evaluate a single-conjunct ``Domain`` to a runtime jax bool by
+    resolving each atom via its ``runtime_value`` (the same path
+    ``_resolve_to_runtime`` uses for slice offsets)."""
+    result = None
+    for conj in dom.disjuncts:
+        c_bool = None
+        for c in conj:
+            v = _resolve_to_runtime(c.expr, tjax_core._loop_var_resolver) >= 0
+            c_bool = v if c_bool is None else (c_bool & v)
+        c_bool = True if c_bool is None else c_bool
+        result = c_bool if result is None else (result | c_bool)
+    return False if result is None else result
+
+
+def _cond_type(then_ty : Type, domain, else_ty : Type) -> Type:
+    """``mask(domain)·then + (1−mask(domain))·else`` at the ET level —
+    the normalizer already handles ``TagCond``-tagged mask tensors and
+    distributive products, so two ``cond``/``when`` calls with the same
+    domain and operands normalize equal."""
+    one = Constant(1.0)
+    zero = Constant(0.0)
+    mask = Tensor(dims=(), tag=TagCond(domain=domain, if_true=one, if_false=zero), name="_mask")
+    not_mask = Tensor(dims=(), tag=TagCond(domain=domain, if_true=zero, if_false=one), name="_mask")
+    m_then = type_from_binary_op(Type((), mask), then_ty, "*")
+    m_else = type_from_binary_op(Type((), not_mask), else_ty, "*")
+    return type_from_binary_op(m_then, m_else, "+")
+
+
+def cond(pred : Domain, then_v : TypedJaxArray, else_v : TypedJaxArray) -> TypedJaxArray:
+    """
+    Value-level conditional: ``then_v`` where ``pred`` holds, else
+    ``else_v``. The ET is the multiplicative form
+    ``mask(pred)·then + (1−mask(pred))·else`` — the same form
+    :func:`when` wraps a tagged carry's type in, so a reference body's
+    ``tpl.cond(layer > 0, mlp, mlp_v)`` normalizes equal to a kernel
+    body's ``mlp_carry.store(mlp)`` inside ``@tpl.when(layer > 0,
+    tags=(mlp_carry,))``. Runtime: the domain is evaluated via
+    ``runtime_value`` and lowered to ``jnp.where``; with no runtime
+    binding (type-only reference), the arr stays ``None``.
+    """
+    new_type = _cond_type(then_v.type, pred, else_v.type)
+    if then_v.arr is None or else_v.arr is None:
+        return TypedJaxArray(None, new_type)
+    return TypedJaxArray(
+        jnp.where(_domain_runtime_bool(pred), then_v.arr, else_v.arr), new_type,
+    )
+
+
+def fori_loop(
+    lower, upper, body, *, name : str = "k",
+    reference_body=None, carries : "tuple[TypedScratchRef, ...]" = (),
+):
+    """
+    Typed ``lax.fori_loop`` over a ref-mutating body.
+
+    ``body`` receives a ``SymbolicInt(name, runtime_value=tracer)`` —
+    so ``layer > 0`` is a stile ``Domain`` (for :func:`when`'s
+    ``TagCond``), ``ref.at(layer)`` uses the runtime tracer, and
+    ``layer * BN`` is an ``AffineExpr`` for slice bounds — and mutates
+    whichever :class:`TypedScratchRef` it closes over via
+    ``.store``/``.copy_from``/``.axiom``.
+
+    **Body equivalence** (``reference_body=`` + ``carries=``): each
+    carry is rebound to a fresh ``Tensor(name=f"{ref}@{name}")`` leaf
+    before the body's single ``lax.fori_loop`` trace; after the trace,
+    ``reference_body(k, *fresh_leaf_values) -> tuple[TypedJaxArray]`` is
+    evaluated type-only and each carry's body-output ET is checked equal
+    to the reference's. Post-loop, each carry's type is an opaque
+    ``_fori_<hash>_<i>`` leaf — same hash both loops produce — so the
+    verifier discharges "body ≡ reference_body ⇒ final ≡ final" by
+    induction, trip-count-independent.
+
+    Without ``reference_body``: the body is traced (typed stores flow);
+    post-loop carry types are "after one iteration from init" —
+    ``.axiom(...)`` them if read after the loop.
+
+    Runtime: emits ``lax.fori_loop`` with a dummy int carry.
+    """
+
+    fresh_values : list[TypedJaxArray] = []
+    if reference_body is not None:
+        for c in carries:
+            full = tuple(dim_full_dim(d) for d in c._type.st)
+            leaf = Type(c._type.st, Tensor(dims=full, name=f"{c._name}@{name}"), c._type.dt)
+            c._type = leaf
+            fresh_values.append(TypedJaxArray(None, leaf))
+
+    jax.lax.fori_loop(
+        lower, upper,
+        lambda k, c: (body(SymbolicInt(name, runtime_value=k)), c)[1],
+        0,
+    )
+
+    if reference_body is not None:
+        body_ets = tuple(c._type.et for c in carries)
+        ref_out = reference_body(SymbolicInt(name), *fresh_values)
+        ref_out = ref_out if isinstance(ref_out, tuple) else (ref_out,)
+        for i, (be, ro) in enumerate(zip(body_ets, ref_out)):
+            if not verify_exprs_equivalent(be, ro.type.et):
+                raise AssertionError(
+                    f"tpl.fori_loop body does not match reference_body at "
+                    f"carry {carries[i]._name!r}."
+                )
+        sig = repr((lower, upper, tuple(repr(normalize(e)) for e in body_ets)))
+        h = hashlib.sha256(sig.encode()).hexdigest()[:16]
+        for i, c in enumerate(carries):
+            full = tuple(dim_full_dim(d) for d in c._type.st)
+            c._type = Type(c._type.st, Tensor(dims=full, name=f"_fori_{h}_{i}"), None)
+
+
+def when(pred, tags : "tuple[TypedScratchRef, ...]" = ()):
+    """
+    Typed ``pl.when`` — runtime-gates the body and ``TagCond``-wraps the
+    types of the listed carry refs.
+
+    ``pred`` is either a stile :class:`Domain` (from ``layer > 0`` where
+    ``layer`` is the ``SymbolicInt`` :func:`fori_loop` hands the body —
+    the runtime bool is derived by evaluating the domain's affine
+    constraints via the atom's ``runtime_value``) or a raw runtime bool
+    (no type effect). For each ref in ``tags``, the pre-body type is
+    snapshotted; on exit the ref's type becomes
+    ``TagCond(pred, body_type, pre_type)`` — so a reference that writes
+    ``mlp.where("k > 0")`` normalizes equal.
+
+    Decorator over a nullary function, same as ``pl.when``::
+
+        @tpl.when(layer > 0, tags=(acts_carry, mlp_carry))
+        def _():
+            acts_carry.store(...); mlp_carry.store(...)
+    """
+    if isinstance(pred, Domain):
+        rt_cond, dom = _domain_runtime_bool(pred), pred
+    else:
+        rt_cond, dom = pred, None
+
+    def decorator(fn):
+        pre = [c._type for c in tags]
+        pl.when(rt_cond)(fn)
+        if dom is not None:
+            for c, old in zip(tags, pre):
+                if c._type is not old:
+                    c._type = _cond_type(c._type, dom, old)
+        return fn
+
+    return decorator
+
+
+@dataclass
+class _PartSlot:
+    """One contiguous view's placement inside its parent untyped buffer."""
+    parent : str
+    offset : int
+    extent : int
+
+
+def _normalize_parts(name : str, parts):
+    if isinstance(parts, int):
+        return [(f"{name}_{i}", 1) for i in range(parts)]
+    return [
+        p if isinstance(p, tuple) else (f"{name}_{i}", int(p))
+        for i, p in enumerate(parts)
+    ]
+
+
+@dataclass
+class UntypedScratchSpec:
+    """
+    Declares a real Pallas VMEM block carved into contiguous views.
+
+    The block's shape is ``(sum(extents), *trailing)``; each view is the
+    ``pl.ds(offset, extent)`` slice of axis 0. The kernel receives an
+    :class:`UntypedScratch` whose views wrap real ``TransformedRef``s
+    into the one block — ``.store``/``.load``/``.copy_from`` are real
+    VMEM writes/reads/DMAs, and a list-form ``tjax.einsum`` over the
+    views reads the parent buffer directly (no ``concatenate``).
+    """
+    name : str
+    parts : "int | list"
+    trailing : tuple
+    dtype : "jnp.dtype" = jnp.float32
+
+    @property
+    def shape(self):
+        norm = _normalize_parts(self.name, self.parts)
+        return (sum(int(e) for _, e in norm), *self.trailing)
+
+
+class UntypedScratch:
+    """
+    A flat VMEM allocation carved into a contiguous list of typed views.
+
+    The parent buffer carries no type — only a name and a layout. Each
+    view is a :class:`TypedScratchRef` (typed by what is
+    ``copy_from``'d/``store``'d into it) plus a :class:`_PartSlot`
+    recording its offset within the parent. With a real parent ref
+    (declared via :class:`UntypedScratchSpec`) each view's ``_ref`` is
+    the ``parent.at[pl.ds(offset, extent)]`` slice — a real Pallas
+    ``TransformedRef`` — so stores/loads/DMAs hit the one physical
+    block, and list-form ``tjax.einsum`` reads ``parent[...]`` directly
+    (no ``concatenate``). Without a real ref (the in-body
+    :func:`untyped_scratch` form) the views are Python-level holders and
+    coalescing concatenates; the type-level result is identical.
+
+    Index by position or by part name.
+    """
+    def __init__(self, name : str, parts, ref=None):
+        self._name = name
+        self._ref = ref
+        self._views : list[TypedScratchRef] = []
+        self._by_name : dict[str, TypedScratchRef] = {}
+        offset = 0
+        for pname, extent in _normalize_parts(name, parts):
+            extent = int(extent)
+            view_ref = ref.at[pl.ds(offset, extent)] if ref is not None else None
+            v = TypedScratchRef(
+                f"{name}.{pname}",
+                ref=view_ref,
+                slot=_PartSlot(parent=name, offset=offset, extent=extent),
+                parent=self,
+            )
+            offset += extent
+            self._views.append(v)
+            self._by_name[pname] = v
+        self._total = offset
+
+    def __iter__(self):
+        return iter(self._views)
+
+    def __len__(self):
+        return len(self._views)
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            return self._by_name[key]
+        return self._views[key]
+
+    def loads(self) -> list[TypedJaxArray]:
+        """``[v.load() for v in self]`` — the list ``tjax.einsum`` accepts."""
+        return [v.load() for v in self._views]
+
+    def parent_arr(self):
+        """The whole-block array (real-ref only) — what a coalesced matmul
+        reads instead of concatenating per-view loads."""
+        return None if self._ref is None else self._ref[...]
+
+
+def untyped_scratch(name : str, parts) -> UntypedScratch:
+    """
+    A contiguous list of :class:`TypedScratchRef` views into one untyped
+    parent buffer, **Python-level** (no VMEM allocation). For a real
+    VMEM block, declare an :class:`UntypedScratchSpec` in
+    ``typed_pallas_call(scratch=...)`` instead — the kernel then
+    receives an :class:`UntypedScratch` whose views are real ref slices.
+    """
+    return UntypedScratch(name, parts)
+
+
+def _view_slot(value : TypedJaxArray) -> "_PartSlot | None":
+    """The originating scratch view's placement, if ``value`` came from one."""
+    return value._slot
 
 
 class TypedOutputRef(TypedRef):
@@ -234,6 +703,7 @@ def typed_pallas_call(
     grid=None,
     in_specs=None,
     out_specs=None,
+    scratch : "int | tuple[str | ScratchSpec | UntypedScratchSpec | Any, ...] | list[str | ScratchSpec | UntypedScratchSpec | Any]" = 0,
     interpret : bool = True,
     compiler_params=None,
 ):
@@ -268,6 +738,14 @@ def typed_pallas_call(
     restricted to the tile via `override_dims_in_type` — so per-block
     `assign(...)` certifies "this block matches the spec's tile."
 
+    **VMEM scratch**: pass ``scratch=`` — either an int (number of
+    anonymous scratch refs) or a tuple of names. The kernel receives
+    that many :class:`TypedScratchRef` objects after the output refs.
+    Scratch refs are unverified mutable cells: ``.store(x)`` records
+    ``x``'s Type, ``.load()`` returns it. Use them to mirror a
+    production kernel's VMEM staging (DMA-in, carry across phases)
+    without the verifier seeing a cut.
+
     `interpret=True` (default) runs the kernel on CPU via Pallas's
     interpreter. Same trace as the GPU/TPU path, so the verifier sees
     identical ASTs — let the dev loop be local, the perf loop be
@@ -275,8 +753,27 @@ def typed_pallas_call(
     """
     out_types, single_out = _normalize_out_types(out_type)
     out_structs = tuple(_out_struct(s) for s in out_types)
+    if isinstance(scratch, int):
+        scratch = tuple(f"scratch_{i}" for i in range(scratch))
+    # Split scratch into Pallas-allocated (ScratchSpec/UntypedScratchSpec →
+    # pltpu.VMEM; raw pltpu.SemaphoreType / pltpu.VMEM passthrough) and
+    # Python-level holders (bare names — no allocation). The kernel receives
+    # them in declaration order; the Pallas-allocated refs arrive after the
+    # output refs.
+    scratch_decls = tuple(scratch)
+    pl_scratch_shapes : list = []
+    for s in scratch_decls:
+        if isinstance(s, (ScratchSpec, UntypedScratchSpec)):
+            pl_scratch_shapes.append(pltpu.VMEM(s.shape, s.dtype))
+        elif not isinstance(s, str):
+            pl_scratch_shapes.append(s)
 
     tiled = grid is not None
+    # ``in_specs`` is dual-purpose: with ``grid=`` it carries per-axis
+    # block slicing (the tiled path below); without, it's a
+    # memory-space-only passthrough (e.g. ``BlockSpec(memory_space=pl.ANY)``
+    # to keep big weights in HBM) and the input's Type is unchanged.
+    nontiled_in_specs = in_specs if (in_specs is not None and not tiled) else None
 
     def runner(*inputs):
         n_in = len(inputs)
@@ -294,6 +791,24 @@ def typed_pallas_call(
         def jax_kernel(*refs):
             input_refs = refs[:n_in]
             output_refs = refs[n_in : n_in + len(out_types)]
+            real_scratch_refs = refs[n_in + len(out_types):]
+            # Build the kernel-order scratch list, drawing real refs from
+            # Pallas where declared and constructing Python-level holders
+            # for bare names. Raw pltpu scratch (semaphores etc.) passes
+            # through unwrapped — semaphores carry no type.
+            real_iter = iter(real_scratch_refs)
+            scratch_refs : list = []
+            for s in scratch_decls:
+                if isinstance(s, UntypedScratchSpec):
+                    scratch_refs.append(
+                        UntypedScratch(s.name, s.parts, ref=next(real_iter))
+                    )
+                elif isinstance(s, ScratchSpec):
+                    scratch_refs.append(TypedScratchRef(s.name, ref=next(real_iter)))
+                elif isinstance(s, str):
+                    scratch_refs.append(TypedScratchRef(s))
+                else:
+                    scratch_refs.append(next(real_iter))
             if tiled:
                 # `tiled` implies these were all supplied together.
                 assert grid is not None and in_specs is not None and out_specs is not None
@@ -344,7 +859,7 @@ def typed_pallas_call(
                 _g_active_tile_overrides.append(tuple(tile_overrides))
                 try:
                     with loop_var_binding(pid_runtime):
-                        kernel_fn(*wrapped_inputs, *wrapped_outputs)
+                        kernel_fn(*wrapped_inputs, *wrapped_outputs, *scratch_refs)
                 finally:
                     _g_active_tile_overrides.pop()
             else:
@@ -358,13 +873,17 @@ def typed_pallas_call(
                     TypedOutputRef(ref, Type(ot.st, et, ot.dt), ot)
                     for ref, ot, et in zip(output_refs, out_types, spec_ets)
                 ]
-                kernel_fn(*wrapped_inputs, *wrapped_outputs)
+                kernel_fn(*wrapped_inputs, *wrapped_outputs, *scratch_refs)
 
         pallas_kwargs = {}
         if tiled:
             pallas_kwargs.update(
                 grid=grid, in_specs=in_specs, out_specs=out_specs,
             )
+        elif nontiled_in_specs is not None:
+            pallas_kwargs['in_specs'] = nontiled_in_specs
+        if pl_scratch_shapes:
+            pallas_kwargs['scratch_shapes'] = pl_scratch_shapes
         if compiler_params is not None:
             pallas_kwargs['compiler_params'] = compiler_params
         result = pl.pallas_call(

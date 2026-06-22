@@ -11,7 +11,7 @@ import functools
 import hashlib
 import inspect
 import math
-from typing import Any, cast
+from typing import Any, cast, overload
 
 import stile.type as t
 # Explicit imports (no wildcard): the frontend redefines exp/sin/cos/
@@ -35,7 +35,7 @@ from ..indexing import (
     SymbolicInt, AffineExpr,
     declare_index_properties, declare_block_pairing, tensor_element,
     declare_tensor_boundary, resolve_symbolic_index,
-    runtime_scalar_max,
+    runtime_scalar_max, runtime_scalar_names,
 )
 from ..tracing import (
     CoverageTracker, _g_runtime_arrs, _bound_as_int, _bound_runtime,
@@ -215,6 +215,7 @@ class TypedJaxArray:
     def __init__(
         self, arr : jax.Array | None, type : Type,
         *, aa : "AffineForm | None" = _NO_AA_DEFAULT,
+        slot=None, parent=None,
     ):
         # `arr` is None when this TypedJaxArray was produced inside a rolled
         # loop (or any context where slice bounds / reduction sizes aren't
@@ -228,11 +229,20 @@ class TypedJaxArray:
         # values flow through tjax ops. Pass an explicit `aa=None` to
         # opt out (e.g., for huge arrays where the leaf computation
         # would be expensive and the caller doesn't need AA tracking).
+        #
+        # `slot`/`parent` are set when this value is a view into an
+        # `UntypedScratch` block (via `TypedScratchRef.load()`): `slot`
+        # is the `_PartSlot(parent_name, offset, extent)` and `parent`
+        # is the `UntypedScratch` instance. List-form `einsum` reads them
+        # to coalesce contiguous views into one matmul over the parent
+        # buffer; everything else ignores them.
         self.arr = arr
         self.type = type
         if aa is _NO_AA_DEFAULT:
             aa = leaf_aa_from_array(arr)
         self.aa = aa
+        self._slot = slot
+        self._parent = parent
 
     # JAX pytree registration: the `arr` is the leaf (so jax.lax.fori_loop
     # and friends can thread the array through their traced graph), the
@@ -247,10 +257,16 @@ class TypedJaxArray:
         `sensitivity_analysis` to swap a named input's precision
         without changing its shape or stile type. The new typed value
         gets a fresh leaf AA derived from the cast array's range.
+        Preserves the untyped-scratch ``_slot``/``_parent`` metadata so
+        list-form ``einsum`` over ``[v.load().astype(f32) for v in buf]``
+        still coalesces.
         """
-        if self.arr is None:
-            return TypedJaxArray(None, self.type)
-        return TypedJaxArray(self.arr.astype(dtype), self.type)
+        new_arr = None if self.arr is None else self.arr.astype(dtype)
+        # ``parent`` not propagated: the parent buffer is at the original
+        # dtype, so the parent-direct path would dtype-mismatch. Preserving
+        # ``slot`` still lets list-einsum recognize contiguity (concatenate
+        # path).
+        return TypedJaxArray(new_arr, self.type, slot=self._slot)
 
     def tree_flatten(self):
         return (self.arr,), self.type
@@ -397,6 +413,20 @@ class TypedJaxArray:
         axis = next(
             i for i, d in enumerate(self.type.st) if dim_name(d) == dim_name(dim)
         )
+        # Mosaic's gather lowering only handles the `take_along_axis` shape
+        # (indices broadcast to the operand's shape with a trailing 1). When
+        # the gathered axis already has the index's length (the permutation
+        # case — e.g. the rope swap), broadcast and use that path; otherwise
+        # `jnp.take` is the general fallback (interpret-mode and CPU/GPU).
+        if self.arr.shape[axis] == idx.arr.shape[0]:
+            bshape = list(self.arr.shape)
+            idx_b = jnp.broadcast_to(
+                idx.arr.reshape([1] * axis + [-1] + [1] * (self.arr.ndim - axis - 1)),
+                bshape,
+            )
+            return TypedJaxArray(
+                jnp.take_along_axis(self.arr, idx_b, axis=axis), new_type,
+            )
         return TypedJaxArray(jnp.take(self.arr, idx.arr, axis=axis), new_type)
 
     def scatter(
@@ -551,15 +581,18 @@ def _build_predicate_array(
         for c in conj:
             term_value = jnp.full(shape, c.expr.const, dtype=jnp.int32)
             for var, coeff in c.expr.terms:
-                if var.name not in name_to_axis:
-                    raise ValueError(
-                        f"Predicate variable {var.name!r} not in tensor's dims"
-                    )
-                axis = name_to_axis[var.name]
-                idx = jnp.arange(shape[axis], dtype=jnp.int32) + starts[axis]
-                shape_bc = [1] * len(shape)
-                shape_bc[axis] = shape[axis]
-                term_value = term_value + coeff * idx.reshape(shape_bc)
+                if var.name in name_to_axis:
+                    axis = name_to_axis[var.name]
+                    idx = jnp.arange(shape[axis], dtype=jnp.int32) + starts[axis]
+                    shape_bc = [1] * len(shape)
+                    shape_bc[axis] = shape[axis]
+                    term_value = term_value + coeff * idx.reshape(shape_bc)
+                    continue
+                # Not a dim axis: must be a runtime scalar (or a bound
+                # loop var like `_pid_<i>`); resolve its scalar runtime
+                # value the same way slice offsets are resolved.
+                rt = _resolve_to_runtime(var, _loop_var_resolver)
+                term_value = term_value + coeff * rt
             constraint = term_value >= 0
             conj_mask = constraint if conj_mask is None else (conj_mask & constraint)
         if conj_mask is None:
@@ -596,11 +629,13 @@ def mask(
     lex = LexState(predicate_str)
     pred_domain = parse_predicate(lex)
     dim_names_in_shape = {dim_name(d) for d in shape}
+    rt_scalars = runtime_scalar_names()
     for v in pred_domain.variables:
-        if v.name not in dim_names_in_shape:
+        if v.name not in dim_names_in_shape and v.name not in rt_scalars:
             raise ValueError(
-                f"`mask` predicate references dim {v.name!r} not in "
-                f"shape {sorted(dim_names_in_shape)}"
+                f"`mask` predicate references {v.name!r}, which is neither "
+                f"a dim in shape {sorted(dim_names_in_shape)} nor a "
+                f"registered runtime scalar"
             )
     full_dims = tuple(dim_full_dim(d) for d in shape)
     mask_et = Tensor(
@@ -729,6 +764,22 @@ def _sqrt_typed(x : TypedJaxArray) -> TypedJaxArray:
     return _apply_unary(x, t.sqrt(x.type), jnp.sqrt, aa_op="sqrt")
 
 
+def rsqrt(x):
+    """
+    `tjax.rsqrt` — `1/sqrt(x)`. Lowers to the same ET as
+    ``1.0 / tjax.sqrt(x)`` (so a kernel using ``rsqrt`` verifies against
+    a spec written with ``/ sqrt(...)``), but the runtime path uses
+    ``jax.lax.rsqrt`` to match production numerics. Eager on Python
+    scalars, like :func:`sqrt`.
+    """
+    if isinstance(x, (int, float)):
+        return 1.0 / math.sqrt(x)
+    one_over_sqrt = type_from_binary_op(
+        Type((), Constant(1.0)), t.sqrt(x.type), "/",
+    )
+    return _apply_unary(x, one_over_sqrt, jax.lax.rsqrt, aa_op=None)
+
+
 def maximum(x : TypedJaxArray, y : TypedJaxArray) -> TypedJaxArray:
     return _binary_op_helper(x, y, "max")
 
@@ -759,7 +810,67 @@ def relu(x : TypedJaxArray) -> TypedJaxArray:
     return _binary_op_helper(x, 0.0, "max")
 
 
-def einsum(x : TypedJaxArray, y : TypedJaxArray, einstr : str) -> TypedJaxArray:
+@overload
+def einsum(
+    x : TypedJaxArray, y : "TypedJaxArray", einstr : str, *,
+    preferred_element_type=None,
+) -> "TypedJaxArray": ...
+@overload
+def einsum(
+    x : TypedJaxArray, y : "list[TypedJaxArray] | tuple[TypedJaxArray, ...]",
+    einstr : str, *, preferred_element_type=None,
+) -> "list[TypedJaxArray]": ...
+def einsum(x : TypedJaxArray, y, einstr : str, *, preferred_element_type=None):
+    """
+    `tjax.einsum` — typed einsum over named dims.
+
+    `y` may be a single `TypedJaxArray` (returns one) or a *list* of
+    them (returns a list of the same length, one independent result per
+    entry). The list form models a Pallas kernel matmul-ing over a
+    contiguous run of VMEM views: at the type level each output's ET is
+    `einsum(x.et, y[i].et, einstr)` — no fused-axis bookkeeping; at the
+    runtime level, when every `y[i]` carries the same `_slot.parent`
+    with dense offsets (i.e., they're contiguous slices of one untyped
+    scratch buffer), the arrs are concatenated along axis 0, one
+    `einops.einsum` runs over the coalesced operand, and the result is
+    sliced back per view. Non-contiguous lists (or entries with no
+    `_slot`) fall back to per-entry einsums; the typed result is the
+    same either way.
+
+    ``preferred_element_type`` forwards to ``jnp.einsum`` /
+    ``lax.dot_general`` so the MXU can run mixed-dtype (e.g. fp8×bf16
+    inputs accumulating in f32) without an upfront cast. The type level
+    is unchanged (the verifier ignores dtype).
+    """
+    if isinstance(y, (list, tuple)):
+        return _einsum_list(x, list(y), einstr, preferred_element_type)
+    return _einsum_one(x, y, einstr, preferred_element_type)
+
+
+def _to_jnp_einstr(einstr : str) -> str:
+    """``"B D, HF D -> B HF"`` → ``"ab,cb->ac"`` for ``jnp.einsum``."""
+    lhs, rhs_out = einstr.split(",", 1)
+    rhs, out = rhs_out.split("->", 1)
+    names : list[str] = []
+    for d in lhs.split() + rhs.split() + out.split():
+        if d not in names:
+            names.append(d)
+    if len(names) > 52:
+        raise ValueError(f"too many distinct dims for jnp.einsum: {len(names)}")
+    alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    to_c = {n: alphabet[i] for i, n in enumerate(names)}
+    return (
+        "".join(to_c[d] for d in lhs.split())
+        + ","
+        + "".join(to_c[d] for d in rhs.split())
+        + "->"
+        + "".join(to_c[d] for d in out.split())
+    )
+
+
+def _einsum_one(
+    x : TypedJaxArray, y : TypedJaxArray, einstr : str, pet=None,
+) -> TypedJaxArray:
     new_type = t.einsum(x.type, y.type, einstr)
     new_aa = compose_einsum(
         x.aa, y.aa, x.type, y.type, einstr, active_hardware(),
@@ -768,8 +879,112 @@ def einsum(x : TypedJaxArray, y : TypedJaxArray, einstr : str) -> TypedJaxArray:
     if x.arr is None or y.arr is None:
         return TypedJaxArray(None, new_type, aa=new_aa)
     return TypedJaxArray(
-        einops.einsum(x.arr, y.arr, einstr), new_type, aa=new_aa,
+        _einsum_one_runtime(x.arr, y.arr, einstr, pet), new_type, aa=new_aa,
     )
+
+
+def _einsum_one_runtime(x_arr, y_arr, einstr : str, pet=None):
+    """
+    Runtime path for single-result einsum. When every output dim appears
+    in *both* operands (a batched inner product — e.g.
+    ``"B HF, B HF -> B"``), Mosaic cannot lower the batch-only
+    ``dot_general`` ``einops.einsum`` would produce; emit
+    ``(x * y).sum(contracted)`` instead — same value, lowers as
+    elementwise-mul + reduce. Otherwise defer to ``einops.einsum``.
+    """
+    lhs, rhs_out = einstr.split(",", 1)
+    rhs, out = rhs_out.split("->", 1)
+    ldims, rdims, odims = lhs.split(), rhs.split(), out.split()
+    if set(odims) <= (set(ldims) & set(rdims)):
+        contracted = [
+            i for i, d in enumerate(ldims) if d in rdims and d not in odims
+        ]
+        rperm = [rdims.index(d) for d in ldims]
+        # Mixed-dtype mul promotes; pet pins the accumulator.
+        prod = (x_arr * jnp.transpose(y_arr, rperm))
+        if pet is not None:
+            prod = prod.astype(pet)
+        red = prod.sum(axis=tuple(contracted)) if contracted else prod
+        out_from_l = [d for d in ldims if d in odims]
+        return jnp.transpose(red, [out_from_l.index(d) for d in odims])
+    if pet is not None:
+        return jnp.einsum(
+            _to_jnp_einstr(einstr), x_arr, y_arr, preferred_element_type=pet,
+        )
+    return einops.einsum(x_arr, y_arr, einstr)
+
+
+def _einsum_list(
+    x : TypedJaxArray, ys : list[TypedJaxArray], einstr : str, pet=None,
+) -> list[TypedJaxArray]:
+    out_types = [t.einsum(x.type, y.type, einstr) for y in ys]
+    if x.arr is None or any(y.arr is None for y in ys):
+        return [TypedJaxArray(None, ot, aa=None) for ot in out_types]
+    out_arrs = _einsum_list_runtime(x.arr, ys, einstr, pet)
+    return [
+        TypedJaxArray(arr, ot, aa=None) for arr, ot in zip(out_arrs, out_types)
+    ]
+
+
+def _einsum_list_runtime(x_arr, ys : list[TypedJaxArray], einstr : str, pet=None):
+    """
+    Runtime path for list-form einsum. Coalesces `ys` along axis 0 into
+    one matmul when every entry is a contiguous view of the same
+    untyped-scratch parent (via `._slot`); otherwise per-entry einsum.
+    The leading dim of `y` must be free (not contracted) in `einstr` —
+    that's the axis the coalesced result is sliced back along.
+    """
+    slots = [y._slot for y in ys]
+    contiguous = (
+        all(s is not None for s in slots)
+        and len({s.parent for s in slots}) == 1
+        and all(
+            slots[i].offset + slots[i].extent == slots[i + 1].offset
+            for i in range(len(slots) - 1)
+        )
+    )
+    extents = [y.arr.shape[0] for y in ys]
+    if not contiguous:
+        return [_einsum_one_runtime(x_arr, y.arr, einstr, pet) for y in ys]
+    # One matmul over the coalesced [sum(extents), ...] operand; slice
+    # the [..., sum(extents), ...] result back per view along the dim
+    # that `y`'s leading axis mapped to.
+    lhs, rhs_out = einstr.split(",", 1)
+    rhs, out = rhs_out.split("->", 1)
+    lead = rhs.split()[0]
+    out_dims = out.split()
+    if lead not in out_dims:
+        raise ValueError(
+            "list-form einsum requires y's leading dim to be free "
+            f"(present in the output); got einstr={einstr!r}"
+        )
+    out_axis = out_dims.index(lead)
+    # When the views share a real parent VMEM block and span all of it,
+    # the coalesced operand is the parent buffer itself — no concatenate.
+    parents = {y._parent for y in ys}
+    parent = parents.pop() if len(parents) == 1 else None
+    parent_arr = parent.parent_arr() if parent is not None else None
+    if (
+        parent_arr is not None
+        and slots[0].offset == 0
+        and slots[-1].offset + slots[-1].extent == parent_arr.shape[0]
+    ):
+        y_co = parent_arr
+    else:
+        y_co = jnp.concatenate([y.arr for y in ys], axis=0)
+    if pet is not None:
+        full = jnp.einsum(
+            _to_jnp_einstr(einstr), x_arr, y_co, preferred_element_type=pet,
+        )
+    else:
+        full = einops.einsum(x_arr, y_co, einstr)
+    # Static-offset slice (Mosaic has no `dynamic_slice` lowering; offsets here
+    # are Python ints derived from the views' static shapes).
+    outs, off = [], 0
+    for ext in extents:
+        outs.append(jax.lax.slice_in_dim(full, off, off + ext, axis=out_axis))
+        off += ext
+    return outs
 
 
 def _fori_body_signature(lower, upper, ref_body, init_val):

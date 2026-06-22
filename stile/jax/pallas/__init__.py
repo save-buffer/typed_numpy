@@ -1,6 +1,15 @@
 from ._core import (
     TypedRef,
     TypedOutputRef,
+    TypedScratchRef,
+    UntypedScratch,
     OutputSpec,
+    ScratchSpec,
+    UntypedScratchSpec,
     typed_pallas_call,
+    untyped_scratch,
+    bound_runtime_scalars,
+    when,
+    cond,
+    fori_loop,
 )

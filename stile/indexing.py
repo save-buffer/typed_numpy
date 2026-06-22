@@ -60,6 +60,14 @@ class SymbolicInt:
     def __mul__(self, k : int) -> "AffineExpr": return to_affine(self) * k
     def __rmul__(self, k : int) -> "AffineExpr": return to_affine(self) * k
     def __neg__(self) -> "AffineExpr": return -to_affine(self)
+    # Comparisons return a single-conjunct `Domain` so `k > 0` can flow
+    # straight into a `TagCond` (e.g. via `tpl.when`). Framework-agnostic;
+    # the runtime bool comes from evaluating the domain via the atom's
+    # `runtime_value` (see `tpl.when`).
+    def __gt__(self, k) -> "Domain": return domain([self], [gt(self, k)])
+    def __ge__(self, k) -> "Domain": return domain([self], [ge(self, k)])
+    def __lt__(self, k) -> "Domain": return domain([self], [lt(self, k)])
+    def __le__(self, k) -> "Domain": return domain([self], [le(self, k)])
 
 
 # Backward-compat alias — pre-rename, this was the only name for the

@@ -5,6 +5,7 @@ from ._core import (
     sin,
     cos,
     sqrt,
+    rsqrt,
     sigmoid,
     maximum,
     minimum,
