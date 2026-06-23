@@ -233,10 +233,10 @@ class TypedScratchRef:
         *not* touch the ref (the raw block already did); contrast with
         :meth:`store`, which both writes and types.
 
-        The typical pattern with the explicit-device model from
-        ``collectives.py``::
+        Typical pattern — a cross-device collective writes the ref via raw
+        Pallas, then its typed effect is declared::
 
-            _trivance_ar_body(peer_ref, ar_in._ref, ar_out._ref, ...)
+            raw_all_reduce(ar_in.ref, ar_out.ref, ...)
             ar_out.axiom(ar_in.load().sum(dev))
         """
         if not isinstance(declared, TypedJaxArray):
@@ -326,11 +326,11 @@ def cond(pred : Domain, then_v : TypedJaxArray, else_v : TypedJaxArray) -> Typed
     ``else_v``. The ET is the multiplicative form
     ``mask(pred)·then + (1−mask(pred))·else`` — the same form
     :func:`when` wraps a tagged carry's type in, so a reference body's
-    ``tpl.cond(layer > 0, mlp, mlp_v)`` normalizes equal to a kernel
-    body's ``mlp_carry.store(mlp)`` inside ``@tpl.when(layer > 0,
-    tags=(mlp_carry,))``. Runtime: the domain is evaluated via
-    ``runtime_value`` and lowered to ``jnp.where``; with no runtime
-    binding (type-only reference), the arr stays ``None``.
+    ``tpl.cond(k > 0, x, x_prev)`` normalizes equal to a kernel body's
+    ``carry.store(x)`` inside ``@tpl.when(k > 0, tags=(carry,))``.
+    Runtime: the domain is evaluated via ``runtime_value`` and lowered
+    to ``jnp.where``; with no runtime binding (type-only reference), the
+    arr stays ``None``.
     """
     new_type = _cond_type(then_v.type, pred, else_v.type)
     if then_v.arr is None or else_v.arr is None:
@@ -348,10 +348,10 @@ def fori_loop(
     Typed ``lax.fori_loop`` over a ref-mutating body.
 
     ``body`` receives a ``SymbolicInt(name, runtime_value=tracer)`` —
-    so ``layer > 0`` is a stile ``Domain`` (for :func:`when`'s
-    ``TagCond``), ``ref.at(layer)`` uses the runtime tracer, and
-    ``layer * BN`` is an ``AffineExpr`` for slice bounds — and mutates
-    whichever :class:`TypedScratchRef` it closes over via
+    so ``k > 0`` is a stile ``Domain`` (for :func:`when`'s
+    ``TagCond``), ``ref.at(k)`` uses the runtime tracer, and ``k * BN``
+    is an ``AffineExpr`` for slice bounds — and mutates whichever
+    :class:`TypedScratchRef` it closes over via
     ``.store``/``.copy_from``/``.axiom``.
 
     **Body equivalence** (``reference_body=`` + ``carries=``): each
@@ -407,20 +407,20 @@ def when(pred, tags : "tuple[TypedScratchRef, ...]" = ()):
     Typed ``pl.when`` — runtime-gates the body and ``TagCond``-wraps the
     types of the listed carry refs.
 
-    ``pred`` is either a stile :class:`Domain` (from ``layer > 0`` where
-    ``layer`` is the ``SymbolicInt`` :func:`fori_loop` hands the body —
-    the runtime bool is derived by evaluating the domain's affine
+    ``pred`` is either a stile :class:`Domain` (from ``k > 0`` where
+    ``k`` is the ``SymbolicInt`` :func:`fori_loop` hands the body — the
+    runtime bool is derived by evaluating the domain's affine
     constraints via the atom's ``runtime_value``) or a raw runtime bool
     (no type effect). For each ref in ``tags``, the pre-body type is
     snapshotted; on exit the ref's type becomes
     ``TagCond(pred, body_type, pre_type)`` — so a reference that writes
-    ``mlp.where("k > 0")`` normalizes equal.
+    ``x.where("k > 0")`` normalizes equal.
 
     Decorator over a nullary function, same as ``pl.when``::
 
-        @tpl.when(layer > 0, tags=(acts_carry, mlp_carry))
+        @tpl.when(k > 0, tags=(carry_a, carry_b))
         def _():
-            acts_carry.store(...); mlp_carry.store(...)
+            carry_a.store(...); carry_b.store(...)
     """
     if isinstance(pred, Domain):
         rt_cond, dom = _domain_runtime_bool(pred), pred
@@ -536,6 +536,15 @@ class UntypedScratch:
         """The whole-block array (real-ref only) — what a coalesced matmul
         reads instead of concatenating per-view loads."""
         return None if self._ref is None else self._ref[...]
+
+
+def untyped_scratch_over(name : str, ref, parts) -> UntypedScratch:
+    """An :class:`UntypedScratch` whose parent ref is an *existing* raw
+    Pallas ref (e.g., one allocated via ``pl.pallas_call(scratch_shapes=)``
+    by an existing kernel you're porting). Same as
+    declaring it via :class:`UntypedScratchSpec`, but for the drop-in
+    case where ``pl.pallas_call`` already allocated the buffer."""
+    return UntypedScratch(name, parts, ref=ref)
 
 
 def untyped_scratch(name : str, parts) -> UntypedScratch:
@@ -742,9 +751,9 @@ def typed_pallas_call(
     anonymous scratch refs) or a tuple of names. The kernel receives
     that many :class:`TypedScratchRef` objects after the output refs.
     Scratch refs are unverified mutable cells: ``.store(x)`` records
-    ``x``'s Type, ``.load()`` returns it. Use them to mirror a
-    production kernel's VMEM staging (DMA-in, carry across phases)
-    without the verifier seeing a cut.
+    ``x``'s Type, ``.load()`` returns it. Use them to mirror a Pallas
+    kernel's VMEM staging (DMA-in, carry across phases) without the
+    verifier seeing a cut.
 
     `interpret=True` (default) runs the kernel on CPU via Pallas's
     interpreter. Same trace as the GPU/TPU path, so the verifier sees

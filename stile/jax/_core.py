@@ -413,19 +413,26 @@ class TypedJaxArray:
         axis = next(
             i for i, d in enumerate(self.type.st) if dim_name(d) == dim_name(dim)
         )
-        # Mosaic's gather lowering only handles the `take_along_axis` shape
-        # (indices broadcast to the operand's shape with a trailing 1). When
-        # the gathered axis already has the index's length (the permutation
-        # case — e.g. the rope swap), broadcast and use that path; otherwise
-        # `jnp.take` is the general fallback (interpret-mode and CPU/GPU).
+        # Mosaic's gather lowering only accepts the `take_along_axis` shape
+        # (indices broadcast to the operand's shape) and 2D operands. When
+        # the gathered axis already has the index's length (a permutation),
+        # use that path — flattening leading dims to 2D when the gathered
+        # axis is the last one. Otherwise `jnp.take` is the general fallback
+        # (interpret-mode and CPU/GPU).
         if self.arr.shape[axis] == idx.arr.shape[0]:
-            bshape = list(self.arr.shape)
+            a = self.arr
+            if axis == a.ndim - 1 and a.ndim > 2:
+                flat = a.reshape(-1, a.shape[-1])
+                idx_b = jnp.broadcast_to(idx.arr[None, :], flat.shape)
+                out = jnp.take_along_axis(flat, idx_b, axis=1).reshape(a.shape)
+                return TypedJaxArray(out, new_type)
+            bshape = list(a.shape)
             idx_b = jnp.broadcast_to(
-                idx.arr.reshape([1] * axis + [-1] + [1] * (self.arr.ndim - axis - 1)),
+                idx.arr.reshape([1] * axis + [-1] + [1] * (a.ndim - axis - 1)),
                 bshape,
             )
             return TypedJaxArray(
-                jnp.take_along_axis(self.arr, idx_b, axis=axis), new_type,
+                jnp.take_along_axis(a, idx_b, axis=axis), new_type,
             )
         return TypedJaxArray(jnp.take(self.arr, idx.arr, axis=axis), new_type)
 
@@ -769,7 +776,7 @@ def rsqrt(x):
     `tjax.rsqrt` — `1/sqrt(x)`. Lowers to the same ET as
     ``1.0 / tjax.sqrt(x)`` (so a kernel using ``rsqrt`` verifies against
     a spec written with ``/ sqrt(...)``), but the runtime path uses
-    ``jax.lax.rsqrt`` to match production numerics. Eager on Python
+    ``jax.lax.rsqrt`` (the hardware reciprocal-sqrt). Eager on Python
     scalars, like :func:`sqrt`.
     """
     if isinstance(x, (int, float)):

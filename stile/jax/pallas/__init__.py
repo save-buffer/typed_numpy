@@ -8,6 +8,7 @@ from ._core import (
     UntypedScratchSpec,
     typed_pallas_call,
     untyped_scratch,
+    untyped_scratch_over,
     bound_runtime_scalars,
     when,
     cond,
