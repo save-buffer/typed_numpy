@@ -30,7 +30,6 @@ except ImportError:
         "Pallas support requires the jax extra: pip install stile[jax]"
     ) from None
 
-import hashlib
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -340,6 +339,23 @@ def cond(pred : Domain, then_v : TypedJaxArray, else_v : TypedJaxArray) -> Typed
     )
 
 
+# Process-local registry mapping a fori_loop's body signature (the
+# normalized output ETs — frozen dataclasses, so hashable) to a stable
+# integer id. Dict lookup hashes for speed but falls back to ``__eq__``
+# on collision, so two loops get the same ``_fori_<id>`` leaf names iff
+# their normalized bodies are structurally equal — no hash-collision
+# soundness gap.
+_fori_signature_registry : dict = {}
+
+
+def _fori_signature_id(key) -> int:
+    h = _fori_signature_registry.get(key)
+    if h is None:
+        h = len(_fori_signature_registry)
+        _fori_signature_registry[key] = h
+    return h
+
+
 def fori_loop(
     lower, upper, body, *, name : str = "k",
     reference_body=None, carries : "tuple[TypedScratchRef, ...]" = (),
@@ -395,8 +411,7 @@ def fori_loop(
                     f"tpl.fori_loop body does not match reference_body at "
                     f"carry {carries[i]._name!r}."
                 )
-        sig = repr((lower, upper, tuple(repr(normalize(e)) for e in body_ets)))
-        h = hashlib.sha256(sig.encode()).hexdigest()[:16]
+        h = _fori_signature_id((lower, upper, tuple(normalize(e) for e in body_ets)))
         for i, c in enumerate(carries):
             full = tuple(dim_full_dim(d) for d in c._type.st)
             c._type = Type(c._type.st, Tensor(dims=full, name=f"_fori_{h}_{i}"), None)

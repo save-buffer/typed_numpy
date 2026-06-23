@@ -8,7 +8,6 @@ except ImportError:
     ) from None
 
 import functools
-import hashlib
 import inspect
 import math
 from typing import Any, cast, overload
@@ -1019,7 +1018,24 @@ def _fori_body_signature(lower, upper, ref_body, init_val):
     out = ref_body(k_var, sym_state)
     out_leaves = list(out) if isinstance(out, tuple) else [out]
     out_ets = tuple(_normalize(l.type.et) for l in out_leaves)
-    return repr((as_int(lower), as_int(upper), init_ets, out_ets)), out_leaves
+    return (as_int(lower), as_int(upper), init_ets, out_ets), out_leaves
+
+
+# Process-local registry mapping a fori_loop's body signature (the
+# normalized output ETs — frozen dataclasses, so hashable) to a stable
+# integer id. Dict lookup hashes for speed but falls back to ``__eq__``
+# on collision, so two loops get the same ``_fori_<id>`` leaf names iff
+# their normalized bodies are structurally equal — no hash-collision
+# soundness gap.
+_fori_signature_registry : dict = {}
+
+
+def _fori_signature_id(key) -> int:
+    h = _fori_signature_registry.get(key)
+    if h is None:
+        h = len(_fori_signature_registry)
+        _fori_signature_registry[key] = h
+    return h
 
 
 def _fori_loop_body_equiv(lower, upper, body_fn, init_val, reference_body):
@@ -1050,7 +1066,7 @@ def _fori_loop_body_equiv(lower, upper, body_fn, init_val, reference_body):
                     f"fori_loop body does not match reference_body at carry "
                     f"index {i}."
                 )
-    h = hashlib.sha256(sig.encode()).hexdigest()[:16]
+    h = _fori_signature_id(sig)
     is_tuple = isinstance(init_val, tuple)
     final = []
     for i, leaf in enumerate(ref_out):
