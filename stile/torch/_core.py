@@ -13,10 +13,11 @@ import stile.type as t
 # type.py's same-named ET builders would shadow-collide them.
 from ..type import (
     BinaryOpType, Constant, DataType, Dim, FullDim, Gather, ReduceOpType,
-    Tensor, Type, as_int, dim_contains, dim_end, dim_full_dim, dim_name,
-    dim_size, dim_start, dt, override_dims_in_type, type_from_binary_op,
+    TagCond, Tensor, Type, as_int, dim_contains, dim_end, dim_full_dim,
+    dim_name, dim_size, dim_start, dt, override_dims_in_type,
+    type_from_binary_op,
 )
-from ..specification import parse_spec_into_type
+from ..specification import LexState, parse_predicate, parse_spec_into_type
 from ..verification import verify_types_equivalent, verify_exprs_equivalent
 from ..indexing import declare_index_properties
 from ..numerical import (
@@ -146,6 +147,26 @@ class TypedTorchTensor:
         new_type = self.type.repeat(dim)
         return TypedTorchTensor(repeated_tensor, new_type)
 
+    def rename_dim(self, old : FullDim, new : FullDim) -> "TypedTorchTensor":
+        """
+        Relabel one dim. The result's ShapeType replaces `old` with `new`;
+        the ExprType is wrapped in ``Gather(self, old, identity-index-over-new)``
+        with the identity index declared a permutation, so a kernel that
+        reads K via the same identity gather verifies. Used for self-
+        attention where Q is over `A` and K/V over a separate `C` of the
+        same size.
+        """
+        if old.size != new.size:
+            raise ValueError(
+                f"rename_dim: sizes differ ({old.name}={old.size} vs "
+                f"{new.name}={new.size})"
+            )
+        idx_name = f"_rename_{old.name}_{new.name}"
+        declare_index_properties(idx_name, "permutation")
+        idx_type = Type(st=(new,), et=t.Tensor(dims=(new,), name=idx_name))
+        new_type = self.type.gather(old, idx_type)
+        return TypedTorchTensor(self.tensor, new_type)
+
     def rearrange(self, *dims : Dim) -> "TypedTorchTensor":
         dims = tuple(dim_full_dim(d) for d in dims)
 
@@ -213,6 +234,16 @@ class TypedTorchTensor:
 
     def __matmul__(self, other) -> "TypedTorchTensor":
         return einsum(self, other, "M N, N K -> M K")
+
+    def where(self, predicate_str : str) -> "TypedTorchTensor":
+        """
+        Multiplicative-mask sugar: ``self * mask(self.type.st, p)``.
+        Same surface shape the spec parser's ``where``-clause produces, so
+        a kernel calling ``.where(p)`` and a spec written with ``where``
+        normalize to the same form. Mirrors ``stile.jax``'s ``.where``.
+        """
+        m = mask(self.type.st, predicate_str)
+        return self * TypedTorchTensor(m.tensor.to(self.tensor.device), m.type)
 
     def assert_equivalent(self, spec : str, *dim_override : Dim):
         expected_type = parse_spec_into_type(spec)
@@ -324,6 +355,94 @@ def relu(x : TypedTorchTensor) -> TypedTorchTensor:
     return _binary_op_helper(x, 0.0, "max")
 
 
+def _build_predicate_tensor(
+    domain,
+    st : tuple[Dim, ...],
+    in_value : float,
+    out_value : float,
+):
+    """
+    Materialize a ``Domain`` (DNF: OR over conjunctions of ``expr >= 0``)
+    into a torch tensor of shape matching ``st``, with ``in_value`` at
+    positions satisfying the domain and ``out_value`` elsewhere. Each axis
+    index is offset by its ``dim_start`` so sliced dims evaluate the
+    predicate at their absolute positions. Torch port of
+    ``stile.jax._core._build_predicate_array``.
+    """
+    shape = tuple(as_int(dim_size(d)) for d in st)
+    if any(s is None for s in shape):
+        raise ValueError(
+            f"`mask` requires concrete dim sizes; got shape={shape}"
+        )
+    starts = tuple(as_int(dim_start(d)) or 0 for d in st)
+    name_to_axis = {dim_name(d) : i for i, d in enumerate(st)}
+
+    final_mask = None
+    for conj in domain.disjuncts:
+        conj_mask = None
+        for c in conj:
+            term_value = torch.full(shape, int(c.expr.const), dtype=torch.int64)
+            for var, coeff in c.expr.terms:
+                if var.name not in name_to_axis:
+                    raise ValueError(
+                        f"`mask` predicate references {var.name!r}, which is "
+                        f"not a dim in shape {sorted(name_to_axis)}"
+                    )
+                axis = name_to_axis[var.name]
+                idx = torch.arange(shape[axis], dtype=torch.int64) + starts[axis]
+                shape_bc = [1] * len(shape)
+                shape_bc[axis] = shape[axis]
+                term_value = term_value + coeff * idx.reshape(shape_bc)
+            constraint = term_value >= 0
+            conj_mask = constraint if conj_mask is None else (conj_mask & constraint)
+        if conj_mask is None:
+            conj_mask = torch.ones(shape, dtype=torch.bool)
+        final_mask = conj_mask if final_mask is None else (final_mask | conj_mask)
+    if final_mask is None:
+        final_mask = torch.zeros(shape, dtype=torch.bool)
+    return torch.where(
+        final_mask, torch.tensor(in_value), torch.tensor(out_value),
+    ).to(torch.float32)
+
+
+def mask(
+    shape : tuple[Dim, ...],
+    predicate_str : str,
+    in_value : float = 1.0,
+    out_value : float = 0.0,
+) -> TypedTorchTensor:
+    """
+    A constant tagged tensor: ``in_value`` at positions satisfying the
+    predicate, ``out_value`` elsewhere. The type's ``st`` is ``shape``;
+    the ``TagCond``'s domain references dims by name via ``LoopVariable``s
+    so the predicate is meaningful regardless of slicing. Mirrors
+    ``stile.jax.mask`` (mult-mask: 1/0; bias-mask: pass ``0.0, -inf``).
+
+    ``.where(p)`` is sugar for ``self * mask(self.type.st, p)``.
+    """
+    lex = LexState(predicate_str)
+    pred_domain = parse_predicate(lex)
+    dim_names_in_shape = {dim_name(d) for d in shape}
+    for v in pred_domain.variables:
+        if v.name not in dim_names_in_shape:
+            raise ValueError(
+                f"`mask` predicate references {v.name!r}, which is not a "
+                f"dim in shape {sorted(dim_names_in_shape)}"
+            )
+    full_dims = tuple(dim_full_dim(d) for d in shape)
+    mask_et = Tensor(
+        dims=full_dims,
+        tag=TagCond(
+            domain=pred_domain,
+            if_true=Constant(in_value),
+            if_false=Constant(out_value),
+        ),
+        name="_mask",
+    )
+    arr = _build_predicate_tensor(pred_domain, shape, in_value, out_value)
+    return TypedTorchTensor(arr, Type(st=shape, et=mask_et))
+
+
 def einsum(x : TypedTorchTensor, y : TypedTorchTensor, einstr : str) -> TypedTorchTensor:
     new_tensor = einops.einsum(x.tensor, y.tensor, einstr)
     new_type = t.einsum(x.type, y.type, einstr)
@@ -405,6 +524,40 @@ def runtime_index(
         size = cast(int, dim_size(dim))
         arr = torch.arange(size, dtype=torch.int32, device=device)
     return TypedTorchTensor(arr, typ)
+
+
+def scatter(
+    src : TypedTorchTensor,
+    dim : FullDim,
+    idx : TypedTorchTensor,
+    *,
+    base : TypedTorchTensor | None = None,
+) -> TypedTorchTensor:
+    """
+    Dual of ``gather``: ``result[..., idx[m], ...] = src[..., m, ...]``;
+    positions not addressed take their value from ``base`` (default
+    zero). Mirrors ``Type.scatter`` — used for KV-cache writeback
+    (``K.scatter(SeqLen, write_pos, base=cache_in)``).
+    """
+    new_type = src.type.scatter(dim, idx.type, base=base.type if base else None)
+    idx_dim = idx.type.st[0]
+    axis = next(
+        i for i, d in enumerate(src.type.st) if dim_name(d) == dim_name(idx_dim)
+    )
+    out_shape = list(src.tensor.shape)
+    out_shape[axis] = cast(int, dim_size(dim))
+    if base is not None:
+        out_t = base.tensor.clone()
+    else:
+        out_t = torch.zeros(
+            out_shape, dtype=src.tensor.dtype, device=src.tensor.device,
+        )
+    idx_i64 = idx.tensor.to(torch.int64)
+    expand_shape = [1] * src.tensor.ndim
+    expand_shape[axis] = src.tensor.shape[axis]
+    idx_bcast = idx_i64.view(expand_shape).expand(src.tensor.shape)
+    out_t.scatter_(axis, idx_bcast, src.tensor)
+    return TypedTorchTensor(out_t, new_type)
 
 
 def gather(

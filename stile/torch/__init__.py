@@ -10,6 +10,7 @@ from ._core import (
     abs,
     relu,
     einsum,
+    mask,
     zeros,
     tensor,
 )
